@@ -1,6 +1,6 @@
 # 视频片段搜索验收记录
 
-最新完成主Agent验证的阶段是2026-10-16开始的 [单部整片试点](full-film-pilot-acceptance-20261016.md)：处理、独立复算、接口及权限回归完成，新索引的真实浏览器搜索、完整原片播放与位置预览于2026-10-17验证；尚无本阶段用户最终验收结论。此前 [原14段接完整原片网页](full-source-web-acceptance-20261016.md) 已由用户验收通过。本文保留各阶段原结果，不用新结果反写旧失败；范围与限制以对应阶段记录和 [两路方案](joint-text-candidate-plan.md) 为准。
+最新验收通过的阶段是2026-10-16开始的 [单部整片试点](full-film-pilot-acceptance-20261016.md)：处理、独立复算、接口及权限回归完成，新索引的真实浏览器搜索、完整原片播放与位置预览于2026-10-17验证；用户经临时内网入口验收后明确回复“验收通过”，临时入口已按约定撤下。此前 [原14段接完整原片网页](full-source-web-acceptance-20261016.md) 亦已由用户验收通过。本文保留各阶段原结果，不用新结果反写旧失败；范围与限制以对应阶段记录和 [两路方案](joint-text-candidate-plan.md) 为准。
 
 本文件区分已测结果与仍待验收的功能。关联 [Issue #1](https://github.com/jattchen/jellyfin/issues/1)；范围及通过条件以[实施约定](embeddinggemma2-video-search-plan.md)为准。
 
