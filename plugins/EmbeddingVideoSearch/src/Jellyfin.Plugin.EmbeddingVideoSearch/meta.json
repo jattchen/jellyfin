@@ -1,0 +1,12 @@
+{
+  "guid": "8f4c2a91-6d3e-4b7a-9c15-2e8d0f6a4b17",
+  "name": "Embedding Video Search",
+  "description": "Search video pictures and dialogue by meaning.",
+  "overview": "Segment search for unmodified Jellyfin 12.2.0. This build exposes the versioned HTTP API and stores windows in the server data directory.",
+  "owner": "jattchen",
+  "category": "General",
+  "targetAbi": "12.2.0.0",
+  "version": "0.1.0.0",
+  "changelog": "Minimum loadable search API.",
+  "autoUpdate": false
+}
