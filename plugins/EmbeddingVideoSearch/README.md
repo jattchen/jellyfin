@@ -15,7 +15,7 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 用户已授权一部完整原片的独立试点，范围见 [单片计划](../../docs/full-film-pilot-plan.md)。这是显式运行的离线脚本，不是插件的自动转录或整库入库功能。模型、原片、302个联合窗及资源设置在私有 `protocol.json` 中固定；私有原文、音频、向量和检查点不进入Git。
 
-当前隔离实例已导入329条joint和164条text，第一部完整、另两部仍为partial；新曲线绑定新候选池，评分公式未改。处理、接口及尚待补齐的真实浏览器证据见 [单片实际记录](../../docs/full-film-pilot-acceptance-20261016.md)。
+当前隔离实例已导入329条joint和164条text，第一部完整、另两部仍为partial；新曲线绑定新候选池，评分公式未改。处理、接口及2026-10-17主Agent真实浏览器搜索、完整原片播放和位置预览证据见 [单片实际记录](../../docs/full-film-pilot-acceptance-20261016.md)。
 
 - `full-film-transcribe.py --run RUN --stage prepare`：用协议中已安装的worker Python依次运行 `prepare`、`asr`、`align`、`documents`。保留65块的原始转写、对齐、采样绝对位置、耗时和内存记录，分段不改字；截断、失败及未知状态会阻止续做。标点/空白单独保留但不送文字编码，越界单元保留并拒绝，定位资格按最终整数ticks判断。
 - `full-film-embed.py --run RUN --stage joint`：先运行joint，再将stage改为text。复核输入/响应哈希和模型签名后复用成功检查点；新请求逐条发送，不自动重试。joint可加 `--prefetch-clips`，最多提前一个CPU切片、2个编码线程，仍只有一个模型请求；text不能加此选项。本机HTTP显式绕过系统代理，避免loopback被代理接管。
