@@ -11,11 +11,23 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 `./build.sh` 会跑测试，并打出两份加载目录：`artifacts/plugin-with-sqlite`（自带 SQLite 程序集）和 `artifacts/plugin-host-sqlite`（只有插件 DLL）。哪一份能在官方宿主里打开索引，以临时宿主实测为准。
 
+## 单片离线试点
+
+用户已授权一部完整原片的独立试点，范围见 [单片计划](../../docs/full-film-pilot-plan.md)。这是显式运行的离线脚本，不是插件的自动转录或整库入库功能。模型、原片、302个联合窗及资源设置在私有 `protocol.json` 中固定；私有原文、音频、向量和检查点不进入Git。
+
+当前隔离实例已导入329条joint和164条text，第一部完整、另两部仍为partial；新曲线绑定新候选池，评分公式未改。处理、接口及尚待补齐的真实浏览器证据见 [单片实际记录](../../docs/full-film-pilot-acceptance-20261016.md)。
+
+- `full-film-transcribe.py --run RUN --stage prepare`：用协议中已安装的worker Python依次运行 `prepare`、`asr`、`align`、`documents`。保留65块的原始转写、对齐、采样绝对位置、耗时和内存记录，分段不改字；截断、失败及未知状态会阻止续做。标点/空白单独保留但不送文字编码，越界单元保留并拒绝，定位资格按最终整数ticks判断。
+- `full-film-embed.py --run RUN --stage joint`：先运行joint，再将stage改为text。复核输入/响应哈希和模型签名后复用成功检查点；新请求逐条发送，不自动重试。joint可加 `--prefetch-clips`，最多提前一个CPU切片、2个编码线程，仍只有一个模型请求；text不能加此选项。本机HTTP显式绕过系统代理，避免loopback被代理接管。
+- `full-film-import.py --run RUN --references REFERENCE_CACHE --output NEW_DIRECTORY`：从备份创建全新离线索引，完整校验302个联合窗、文字响应及原16条参考缓存。只替换试点原片的启用候选，保留另两片及旧版本；沿原算法对新候选池生成新曲线，不新增参考query输入。不会写运行中的索引，安装新副本仍需独立验证、备份和停止自有隔离宿主。
+
+ASR/对齐与两路embedding不要同时推理。单片脚本合成检查分别为 `full-film-transcribe-test.py` 的20项（worker Python）和 `full-film-embed-test.py` 的11项（Python3）；不代替真实导入、网页、播放和权限验收。
+
 ## HTTP
 
 ### 2026-10-16 原片页内播放与位置预览
 
-最新确认范围见服务端 `docs/full-source-web-plan.md`。取消固定查询白名单和累计95条的旧试验停止线，只新增文字query，不处理全片索引或自动转录。复用现有67条向量的完整原片绑定仍只覆盖原14段。
+原14段阶段的确认范围见服务端 `docs/full-source-web-plan.md`；该阶段已验收并本地保存。它取消固定查询白名单和累计95条的旧试验停止线，复用67条向量绑定完整原片播放。后续单片索引试点见上节，不改这里的播放协议。
 
 - `POST playback`：当前登录的标准Authorization，正文 `{segmentId, expectedBindingVersion}`；返回 `playbackId/manifestUrl/itemId/mediaSourceId/bindingVersion/startTicks/durationTicks/timelineOriginTicks`。缺失或不一致的绑定版本返回409。完整原片HLS清单从0计时，`timelineOriginTicks=0`，起播/跳转使用原片绝对时间。
 - `GET playback/{id}/resources/{resourceId}`：资源编号不授予权限。每个请求由宿主重新鉴权，再检查创建者、原登录头指纹、播放权限、候选绑定、媒体源和当前内容版本。固定loopback宿主协商并转发官方HLS，仅复制既有视频/音频编码。清单内后续地址全部改写为插件入口，移除官方生成地址中的token参数；前端HLS请求必须带Authorization，不使用cookie或裸静态原片地址。
@@ -51,7 +63,7 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 搜索命中和片段详情可以多一个 `transcript`。它只包含这条候选自己已经保存的原文，而且只有当前用户仍有权看到该片段时才会出现。没有原文就不写这个字段。仅仅时间相交的另一条候选，不会把对白借过来；播放范围完全相同的两条才会留下较强那条，并带上这一范围自己的原文。
 
-接回完整原片之后，这 67 条仍只覆盖每部片子里的一小段。对应媒体行是 `partial`。响应和每条命中的 `indexComplete` 都是 false，不能说成整部已经索引完。
+原14段接回完整原片时，67条只覆盖每部片子里的一小段，对应媒体行为 `partial`，每条命中的 `indexComplete` 为false。后续单片导入只将完成全部窗口的该片改为 `complete`；另两片继续为partial，整体库仍非完整覆盖。
 
 ### 只使用已导入候选
 
@@ -138,7 +150,7 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 `libraryIds` 可省略，表示当前用户能看见且已启用的库。`limit` 默认 24，最大 50。
 
-还没有导入两路候选时，`quality` 为 `related` 或 `weak`，`score` 是余弦。导入画面和文字两路候选之后，路由和 `apiVersion` 仍是 1。`qualityPolicy.scoreMeaning` 变为 `referenceTailR`，并带上 `rankingVersion` 和各表示自己的版本。每条结果 `quality` 为 `candidate`，`score` 是 R，`rawScore` 是余弦，`representation` 为 `jointAudioVideo` 或 `transcriptText`，另有 `candidateId` 和 `canonical`。`itemId`、`mediaSourceId`、`startTicks`、`endTicks` 仍是这条样片自己的身份和局部时间。`canonical` 只给诊断追踪，不拿来播放。片段详情同样带上表示、候选编号和锚点，`score` 为 0，不再当作名次。合榜按固定锚点把两路排在一起；时间只是相交时不折叠。只有样片来源和时间范围完全相同，才留 R 更高的一条。
+还没有导入两路候选时，`quality` 为 `related` 或 `weak`，`score` 是余弦。导入画面和文字两路候选之后，路由和 `apiVersion` 仍是 1。`qualityPolicy.scoreMeaning` 变为 `referenceTailR`，并带上 `rankingVersion` 和各表示自己的版本。每条结果 `quality` 为 `candidate`，`score` 是 R，`rawScore` 是余弦，`representation` 为 `jointAudioVideo` 或 `transcriptText`，另有 `candidateId` 和 `canonical`。`itemId`、`mediaSourceId`、`startTicks`、`endTicks` 是实际播放媒体的身份和该媒体内时间：样片阶段是局部时间，原片模式是片头起算的时间。播放直接用这些字段，不再叠加canonical偏移。`canonical` 用于原片追踪。片段详情同样带上表示、候选编号和锚点，`score` 为 0，不再当作名次。合榜按固定锚点把两路排在一起；时间只是相交时不折叠。只有可播放媒体源和时间范围完全相同，才留 R 更高的一条。
 
 ```json
 {
