@@ -205,8 +205,8 @@ def replace_once(path, pattern, replacement):
     path.write_text(new)
 
 
-def patch_config(port):
-    config = DATA / "config"
+def patch_config(port, data=DATA):
+    config = data / "config"
     replace_once(config / "system.xml", r"<CachePath>[^<]*</CachePath>", f"<CachePath>{CACHE}</CachePath>")
     replace_once(config / "encoding.xml", r"<TranscodingTempPath>[^<]*</TranscodingTempPath>",
                  f"<TranscodingTempPath>{CACHE}/transcodes</TranscodingTempPath>")
@@ -232,26 +232,91 @@ def migrate(port):
     backup = ROOT / "backups" / f"docker-config-{ts}"
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup_docker_config(backup)
-    if DATA.exists():
-        replaced = ROOT / "replaced" / f"data-{ts}"
-        replaced.parent.mkdir(parents=True, exist_ok=True)
-        DATA.replace(replaced)
-    shutil.copytree(backup, DATA, symlinks=True)
-    patch_config(port)
-    plugin = DATA / "plugins/EmbeddingVideoSearch"
-    shutil.copytree(PLUGIN_SOURCE, plugin)
-    if sha256(plugin / PLUGIN_DLL) != PLUGIN_SHA256:
-        raise SystemExit("Installed plugin checksum mismatch")
-    db = sqlite3.connect(DATA / "data/jellyfin.db")
-    counts = {
-        "items": db.execute("SELECT count(*) FROM BaseItems").fetchone()[0],
-        "users": [r[0] for r in db.execute("SELECT Username FROM Users ORDER BY Username")],
-        "user_data": db.execute("SELECT count(*) FROM UserData").fetchone()[0],
-    }
-    db.close()
+    staging = Path(tempfile.mkdtemp(prefix="migrate-", dir=ROOT))
+    replaced = None
+    try:
+        shutil.copytree(backup, staging, symlinks=True, dirs_exist_ok=True)
+        patch_config(port, staging)
+        plugin = staging / "plugins/EmbeddingVideoSearch"
+        shutil.copytree(PLUGIN_SOURCE, plugin)
+        if sha256(plugin / PLUGIN_DLL) != PLUGIN_SHA256:
+            raise SystemExit("Installed plugin checksum mismatch")
+        db = sqlite3.connect(staging / "data/jellyfin.db")
+        try:
+            counts = {
+                "items": db.execute("SELECT count(*) FROM BaseItems").fetchone()[0],
+                "users": [r[0] for r in db.execute("SELECT Username FROM Users ORDER BY Username")],
+                "user_data": db.execute("SELECT count(*) FROM UserData").fetchone()[0],
+            }
+        finally:
+            db.close()
+        if DATA.exists():
+            replaced = ROOT / "replaced" / f"data-{ts}"
+            if replaced.exists():
+                raise SystemExit("Data backup already exists")
+            replaced.parent.mkdir(parents=True, exist_ok=True)
+            DATA.replace(replaced)
+        try:
+            staging.replace(DATA)
+        except BaseException:
+            if replaced is not None:
+                replaced.replace(DATA)
+            raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
     record = {"created": ts, "source": str(DOCKER_CONFIG), "backup": str(backup), "port": port, "counts": counts}
     (backup.parent / f"docker-config-{ts}.json").write_text(json.dumps(record, ensure_ascii=False, indent=2))
     print(json.dumps(record, ensure_ascii=False))
+
+
+def install_index(prepared):
+    """Install a verified offline copy; retain the replaced index for rollback."""
+    require_volume()
+    if loaded() or server_info(configured_port()):
+        raise SystemExit("Stop the native service before installing the index")
+    database = prepared / "index.db"
+    evidence = json.loads((prepared / "rebind-evidence.json").read_text())
+    if sha256(database) != evidence["indexSha256"]:
+        raise SystemExit("Prepared index checksum mismatch")
+    from rebind_index import stopped_database
+    stopped_database(database)
+    mapping = json.loads((prepared / "mapping.json").read_text())
+    core = sqlite3.connect((DATA / "data/jellyfin.db").as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        for film in mapping:
+            row = core.execute("SELECT Id,RunTimeTicks FROM BaseItems WHERE Path=?", (film["sourcePath"],)).fetchone()
+            if not row or row[0].replace("-", "").lower() != film["itemId"].replace("-", "").lower() or row[1] != film["runtimeTicks"]:
+                raise SystemExit("The current migrated library differs from the verified mapping")
+    finally:
+        core.close()
+    parent = DATA / "data/embedding-video-search"
+    target = parent / "8f4c2a91-6d3e-4b7a-9c15-2e8d0f6a4b17"
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="prepared-", dir=parent))
+    backup = None
+    try:
+        shutil.copy2(database, staging / "index.db")
+        if sha256(staging / "index.db") != evidence["indexSha256"]:
+            raise SystemExit("Copied index checksum mismatch")
+        if target.exists():
+            stopped_database(target / "index.db")
+            backup = ROOT / "replaced" / ("index-" + stamp())
+            if backup.exists():
+                raise SystemExit("Index backup already exists")
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            target.replace(backup)
+        try:
+            staging.replace(target)
+        except BaseException:
+            if backup is not None:
+                backup.replace(target)
+            raise
+        print(json.dumps({"index": str(target), "backup": str(backup) if backup else None,
+                          "candidates": evidence["candidateCounts"]}, ensure_ascii=False))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 # ---- root links ------------------------------------------------------------
@@ -371,13 +436,18 @@ def uninstall():
 
 def main():
     parser = argparse.ArgumentParser(description=NAME)
-    parser.add_argument("command", choices=["stage", "migrate", "links", "install", "start", "stop", "restart", "status", "uninstall"])
+    parser.add_argument("command", choices=["stage", "migrate", "install-index", "links", "install", "start", "stop", "restart", "status", "uninstall"])
     parser.add_argument("--port", type=int, default=8097, help="HTTP port written by migrate")
+    parser.add_argument("--prepared-index", type=Path, help="Verified offline rebind output for install-index")
     args = parser.parse_args()
     if args.command == "stage":
         stage()
     elif args.command == "migrate":
         migrate(args.port)
+    elif args.command == "install-index":
+        if args.prepared_index is None:
+            parser.error("install-index requires --prepared-index")
+        install_index(args.prepared_index)
     elif args.command == "links":
         links()
     elif args.command == "install":
