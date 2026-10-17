@@ -23,6 +23,7 @@ Docker 版数据库里存的是容器内路径：视频在 `/media/...`，媒体
 | `data` | 本机版数据（即 `/config`），由 Docker 配置复制并升级 |
 | `cache` | 缓存和转码临时目录 |
 | `query-service` | 三集索引匹配的查询模型代码快照、独立配置和查询证据；只听 18783 |
+| `plugin-releases/<DLL哈希>` | 已验证插件产物；迁移从这里复制，不改历史验收 DLL |
 | `backups/docker-config-<时间>` | 每次迁移前 Docker 配置的完整备份（原件不动） |
 | `replaced/data-<时间>` | 重新迁移时被换下的旧本机数据，不自动删除 |
 
@@ -61,6 +62,8 @@ cd deployment/macos-native
 输出含 `index.db`、映射及哈希证据。`install-index` 必须停机执行，并再次核对本机条目编号和时长；旧索引整目录保留在 `replaced/index-<时间>`。查询只启用动漫库，`manual_pause=1`、`imported_candidates_only=1` 保持不变。
 
 查询模型使用独立命名 App `Jellyfin Search Model.app` 和 LaunchAgent `com.jattora.jellyfin-query-model`。`query_model.py install` 校验冻结源代码及查询记录外壳后复制到本机安装目录，再接管**身份已核对且空闲的原手动验收进程**。未知占用者拒绝接管。新的进程须报告 `processing_id=eg2-0b01d27c8c20b7d920e5`；不能改接身份不同的共享 18780。依赖现有 embedding-service 的 Python 环境和固定模型文件；不修改共享服务配置。模型日志在 `~/Library/Logs/jellyfin-native/query-model.log`。
+
+本机使用的插件另修复了可信反向代理后的播放回连：外部 HTTPS 会改写 `Request.Scheme`，但 8097 实际只听 HTTP。内部回连从当前连接的 TLS feature 判断实际协议，地址仍固定为 `127.0.0.1` 和当前监听端口，不依赖外部 Host。`stage` 将匹配 `PLUGIN_SHA256` 的构建产物复制到 `plugin-releases/`；历史验收目录不变。
 
 macOS 可能要求首次允许新 App 访问外接磁盘；解锁电脑并在真实系统提示中允许后才可继续验证。LaunchAgent 的 `running` 状态不代表 HTTP 已就绪。分别核对 8097 的 `/System/Info/Public`、18783 的 `/readyz` 和 `/v1/models`，再用浏览器验收；整机重启后的顺序仍须另行观察。
 

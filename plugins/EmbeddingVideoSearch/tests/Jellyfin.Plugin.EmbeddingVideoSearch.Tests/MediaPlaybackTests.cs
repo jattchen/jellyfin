@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Xunit;
 
 namespace Jellyfin.Plugin.EmbeddingVideoSearch.Tests;
@@ -6,6 +8,20 @@ public class MediaPlaybackTests
 {
     private static readonly Guid Item = Guid.Parse("7bd8bb2a-11a3-7d25-9efb-9c18afac0339");
     private static readonly Uri Origin = new("http://127.0.0.1:18096/");
+
+    [Theory]
+    [InlineData(false, "https", "http")]
+    [InlineData(true, "http", "https")]
+    public void Loopback_origin_uses_listener_transport_instead_of_forwarded_scheme_or_host(bool tls, string forwardedScheme, string expectedScheme)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Scheme = forwardedScheme;
+        context.Request.Host = new HostString("untrusted.example:443");
+        context.Request.PathBase = "/jellyfin";
+        context.Connection.LocalPort = 8097;
+        if (tls) { context.Features.Set<ITlsConnectionFeature>(new TlsConnectionFeature()); }
+        Assert.Equal($"{expectedScheme}://127.0.0.1:8097/jellyfin/", MediaPlaybackStore.LocalOrigin(context).AbsoluteUri);
+    }
 
     [Fact]
     public void Generated_media_reference_strips_all_token_spellings_without_changing_playback_parameters()

@@ -10,6 +10,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
 
@@ -53,6 +54,14 @@ public sealed partial class SearchRuntime
 /// <summary>Identifiers never authorize media. Every resource goes through the host's current login and binding checks.</summary>
 public sealed class MediaPlaybackStore
 {
+    internal static Uri LocalOrigin(HttpContext context)
+    {
+        // ForwardedHeaders can change Request.Scheme to the proxy's external
+        // HTTPS scheme. The loopback request must use this listener's transport.
+        var scheme = context.Features.Get<ITlsConnectionFeature>() is null ? "http" : "https";
+        return new Uri($"{scheme}://127.0.0.1:{context.Connection.LocalPort}{context.Request.PathBase}/");
+    }
+
     private readonly object _gate = new();
     private readonly Dictionary<Guid, MediaPlaybackSession> _sessions = [];
     internal readonly SemaphoreSlim PreviewGate = new(1, 1);
@@ -263,7 +272,7 @@ public sealed class EmbeddingVideoMediaController : PluginControllerBase
                 return Error(409, "stale", "The clicked media binding has changed.");
             }
             // Internal fixed loopback only. Never trust Host or a caller-supplied upstream URL.
-            var origin = new Uri($"{Request.Scheme}://127.0.0.1:{HttpContext.Connection.LocalPort}{Request.PathBase}/");
+            var origin = MediaPlaybackStore.LocalOrigin(HttpContext);
             var deviceId = User.FindFirst("Jellyfin-DeviceId")?.Value ?? "segment-inline";
             var profile = new
             {

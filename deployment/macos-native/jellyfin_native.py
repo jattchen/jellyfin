@@ -46,9 +46,10 @@ WEB_ID = "web-ae9762d97701"
 WEB_SOURCE = ACCEPTANCE / "dual-web-20261016/full-source-20261016/build-snapshots" / WEB_ID
 WEB_SHA256 = "ae9762d9770104097192e74d076d7a467d2d16544456a7b336492ab68252be0e"
 WEB_DIR = ROOT / "web" / WEB_ID
-PLUGIN_SOURCE = ACCEPTANCE / "three-film-10s-20261017/stock-12.2/data/plugins/EmbeddingVideoSearch"
 PLUGIN_DLL = "Jellyfin.Plugin.EmbeddingVideoSearch.dll"
-PLUGIN_SHA256 = "3eb321d3f59da0d6a2c730acc3f91b6ddf9ff302cf99964903daa86c6f8fac5f"
+PLUGIN_SHA256 = "0732b935fb803938065c16af776d8923735d67d14c03e71a4b6fcf62d95fc003"
+PLUGIN_SOURCE = ROOT / "plugin-releases" / PLUGIN_SHA256
+PLUGIN_BUILD = Path(__file__).resolve().parents[2] / "plugins/EmbeddingVideoSearch/artifacts/plugin-with-sqlite"
 
 LINKS = HOME / ".local/share/jellyfin-native/paths"
 SYNTHETIC = Path("/etc/synthetic.d/jellyfin-native")
@@ -153,6 +154,11 @@ def stage():
             raise SystemExit("Web snapshot checksum mismatch")
         shutil.copytree(WEB_SOURCE, WEB_DIR)
 
+    if not PLUGIN_SOURCE.exists():
+        if not (PLUGIN_BUILD / PLUGIN_DLL).is_file() or sha256(PLUGIN_BUILD / PLUGIN_DLL) != PLUGIN_SHA256:
+            raise SystemExit("Build or restore the verified native HTTPS plugin artifact first")
+        PLUGIN_SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(PLUGIN_BUILD, PLUGIN_SOURCE)
     if sha256(PLUGIN_SOURCE / PLUGIN_DLL) != PLUGIN_SHA256:
         raise SystemExit("Plugin DLL checksum mismatch")
 
