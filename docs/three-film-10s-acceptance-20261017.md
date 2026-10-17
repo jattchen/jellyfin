@@ -1,6 +1,6 @@
 # 三集10秒候选：当前处理与验收证据
 
-2026-10-17。按[执行计划](three-film-10s-candidate-plan.md)处理三部既有完整原片。**编码、独立数值核查、空新索引、真实接口、权限回归及主Agent浏览器验收已完成；用户实际手机对比和参数选择待确认。** 用户处理通知权限提示并回复后，主Agent恢复同一浏览器空间4完成验证，没有另建空间绕过。
+2026-10-17。按[执行计划](three-film-10s-candidate-plan.md)处理三部既有完整原片。**编码、独立数值核查、空新索引、真实接口、权限回归及主Agent浏览器验收已完成。用户于2026-10-17明确要求“先验收完成吧，后续我再另外优化”，本阶段按验收通过收尾。** 用户确认属于本阶段的用户验收结论；未补写未提供的手机型号、浏览器或逐项真机操作，也不据此切换正式服务。 用户处理通知权限提示并回复后，主Agent恢复同一浏览器空间4完成验证，没有另建空间绕过。
 
 ## 实际数据与运行版本
 
@@ -55,12 +55,12 @@
 
 另在**新索引**临时修改media内容版本，下一HLS资源、已缓存预览和片段详情均409；finally恢复原值，详情恢复200，会话清理200。该测试是索引版本漂移fixture，没有修改原片，不宣称模拟过NAS文件替换。
 
-临时内网由既有Caddy发布：
+验收时由既有Caddy临时发布（用户确认收尾后已撤下）：
 
 - 新版：<https://jellyfin-search.home.jattora.com/web/#/search>
 - 旧版：<https://jellyfin-search-old.home.jattora.com/web/#/search>
 
-证书正常、两站Jellyfin HTML成功、直接LAN访问18096/18097失败；新版HTTPS鉴权的片段复核、播放准备、主清单及清理通过，清单无主token。只代理loopback，无路由器端口映射或正式服务变更。浏览器解码/连续播放/前后跳转/悬停预览/布局已由下节的真实交互验证；实际手机体验仍待用户确认，浏览器宽度模拟不能替代真机。用户最终验收后撤下两条临时路由。
+证书正常、两站Jellyfin HTML成功、直接LAN访问18096/18097失败；新版HTTPS鉴权的片段复核、播放准备、主清单及清理通过，清单无主token。只代理loopback，无路由器端口映射或正式服务变更。浏览器解码/连续播放/前后跳转/悬停预览/布局已由下节的真实交互验证；用户已确认阶段收尾，未提供具体手机型号及逐项操作；浏览器宽度模拟不作为真机证据。用户确认收尾后已撤下两条临时路由；HTTPS实测均404、正文unknown host，reserved正式入口保持。
 
 ## 主Agent真实浏览器验收
 
@@ -85,10 +85,17 @@
 
 技术检查沿用匹配版本的模型35项、插件85项、窗口合同12项；文字缓存更新后主Agent运行14项通过，转写规则23项通过。代码与证据仍在独立工作副本/私有目录，无推送、合并或正式部署。
 
-## 可复核文件与未完成项
+## 可复核文件与后续事项
 
 私有根目录：`~/.local/share/jellyfin-video-search-acceptance/20261014-9196a68f/three-film-10s-20261017/`。原文、向量、凭据与媒体均不入Git。
 
 主要证据：`embedding-execution-v3.json`、`all-embedding-main-verification.json`、`new-index-independent-verification.json`、`live-query-independent-verification.json`、`e1-old-new-point-comparison.json`、`legacy-target-range-comparison.json`、`query-acceptance-summary.json`、`live-permissions-final.json`、`content-drift-permission-verification.json`、`lan-entry-verification.json`、`lan-authenticated-playback-verification.json`、`processing-timing-summary.json`、`processing-resource-summary.json`、`final-protected-data-verification.json`。冻结代码/协议及原始失败均保留。
 
-待办：用户通过两条临时内网入口在实际手机比较，并决定是否采用新参数。主Agent技术验收及代码/证据交付不代替用户选择，不把本记录视为用户验收通过；用户确认后撤下两条临时路由并完成该阶段收尾。
+2026-10-17用户确认本阶段验收收尾。两条临时路由已撤下并验证404/unknown host，reserved站点保持。18096旧6秒/493候选与18097新10秒/991候选本机后端和全部数据保留；没有正式服务替换、推送或合并。服务端实现本地提交`27a4f73f46`，模型配置提交`aba3f2f`，验收收尾文档另行本地保存。私有`user-acceptance-closeout.json`记录用户原话、路由撤下及本机签名复核。
+
+以下按用户要求留待另行优化，本次未实施，也不作为本阶段新的阻塞：
+
+- 当前按每部视频最佳候选排序、每片取至多5段，没有相关性拒绝门槛；三部视频容易同时出现，不能把“有候选”当作存在真实匹配。
+- 页面未明显标出跨影片名次或差距，最佳命中突出、其余折叠及弱候选入口可另作界面改进。
+- 相关性门槛与真正无结果须另用相关/无关样本验证；当前参考分不是匹配概率，不能随意设百分比或把不相关过滤宣称已通过。
+- 原有S3/S5及绿色浓雾等质量退化按本文保留，不因验收收尾改写为成功；是否采用某套参数为正式默认不属于本次收尾。
