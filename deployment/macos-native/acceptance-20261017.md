@@ -1,4 +1,6 @@
-# 本机迁移：技术验收通过，等待用户试用
+# 本机迁移验收与正式切换记录
+
+2026-10-18 用户明确回复“验收通过，可以切换”。正式服务已迁到本机 8096；下面 2026-10-17 内容保留为试用阶段证据，正式切换的追加记录见文末。
 
 2026-10-17。用户在 `/converge` 中确认：本轮须让已验收三集的搜索在本机 12.2 可用，提供临时内网 HTTPS 供手机和电脑试用；**用户明确试用通过后才从 Docker 最新数据重迁、切到 8096 并停 Docker**。全库后台索引仍留在 jattchen/jellyfin#3；旧数据及回退能力保留。
 
@@ -36,4 +38,17 @@
 
 私有证据在 `~/.local/share/jellyfin-native/verification-20261017/`：`rebind-evidence.json` 位于 `prepared-index/`，另有 `index-independent-verification.json`、`query-migration-comparison.json`、`https-media-checks.json`、`browser-*.json/png`、`query-model-recovery.json`、`permission-and-cleanup.json`、`data-preservation-final.json`。原文、向量、查询证据及媒体截图不入 Git。
 
-当前停在用户试用；尚未切换正式服务。待用户明确通过后，按 README 的“切换与回退”重迁最新数据、重装已验证索引、核对并切换；随后撤下临时入口。整机重启验收及全库索引仍未完成，不以本轮结果代替。
+以上为 2026-10-17 试用交付时的状态：当时尚未切换正式服务，等待用户确认。整机重启验收及全库索引仍未完成，不以这些结果代替。
+
+## 2026-10-18 正式切换
+
+用户已明确验收通过并授权切换。先停止 8097 和 Docker，将 Docker 最新配置完整备份至 `backups/docker-config-20261018-003533`，新副本执行 10.11 → 12.2 升级及全库扫描，再装回已验证的三集索引。带 136 条记录的试用库完整保留在 `replaced/data-20261018-003533`；按确认方案，正式版采用 Docker 的 135 条记录，不自动合并试用记录。
+
+- 本机 12.2.0 正式监听 `127.0.0.1:8096`，原 <https://jellyfin.home.jattora.com/web/> 入口已返回新版；网页和插件与试用版本一致。Docker 已正常退出，保留原 `unless-stopped` 策略，未改容器或其配置数据。
+- 262 个媒体条目的编号和路径逐项相同；原 135 条观看记录逐项保留，原账号密码和权限一致。Docker 原数据库 SHA256 未变。数据库迁移及全库扫描完成，源视频的已知损坏文件现象沿用此前记录。
+- 三集搜索仍为 991 条候选，四条固定查询各 15 个结果的顺序和分数保持一致。经正式 HTTPS 的片段详情、JPEG、HLS 准备、主/子清单、初始化及实际原片媒体段均成功，会话清理成功；错误绑定 409、匿名媒体 401、普通用户管理 403。
+- 正式 HTTPS 下强制 4K 原片转码，实取 767792 字节的媒体段并由 ffprobe 确认为 1280×720 H.264 + AAC；转码会话已清理。
+- 启动期间曾捕获到非空升级进度响应，安装脚本过早把它当成就绪。服务几秒后正常完成启动；已收紧等待条件为包含 Version 和正确 ProductName，并用“进度响应 → 暂时断连 → 真正就绪”的反例验证。
+- 临时 `jellyfin-search` 入口已撤下，实测 404/`unknown host`；reserved 路由逐行未变，LAN 直连 8096 不通，8097 不再监听。Docker 数据和旧验收数据未删除。
+
+正式切换私有证据：`~/.local/share/jellyfin-native/cutover-20261018/`，包括迁移前 Docker 数据库副本、配置备份记录、`migration-comparison.json`、`https-media-checks.json`、`forced-transcode.json`、正式入口浏览器证据和清理记录。整机重启与全库后台索引仍不在本次已验证结论中。

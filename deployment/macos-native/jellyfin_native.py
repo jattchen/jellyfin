@@ -363,7 +363,9 @@ def wait_ready(port, seconds):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         info = server_info(port)
-        if info:
+        # During database migration the startup application can answer with a
+        # non-empty progress body before the real server is ready.
+        if info and info.get("Version") and info.get("ProductName") == "Jellyfin Server":
             return info
         time.sleep(3)
     return None

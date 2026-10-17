@@ -2,6 +2,8 @@
 
 替换 Docker 里的 Jellyfin 10.11.11，装上 `plugins/EmbeddingVideoSearch` 和 jattchen/jellyfin-web 同名分支的网页构建。跟踪：jattchen/jellyfin#2。
 
+2026-10-18 用户确认试用通过后，已将正式服务切至本机 `127.0.0.1:8096`，日常入口仍为 <https://jellyfin.home.jattora.com/web/>。Docker 容器已停止，原配置和回退数据保留；8097 试用服务及临时域名已下线。详细证据见 [迁移验收记录](acceptance-20261017.md)。
+
 ## 为什么要 `/media` 和 `/config`
 
 Docker 版数据库里存的是容器内路径：视频在 `/media/...`，媒体库根目录和海报在 `/config/...`。Jellyfin 的条目编号由路径算出，路径一变就会被当成新条目，观看记录对不上。所以本机版保持这两个路径不变：
@@ -65,11 +67,11 @@ cd deployment/macos-native
 
 本机使用的插件另修复了可信反向代理后的播放回连：外部 HTTPS 会改写 `Request.Scheme`，但 8097 实际只听 HTTP。内部回连从当前连接的 TLS feature 判断实际协议，地址仍固定为 `127.0.0.1` 和当前监听端口，不依赖外部 Host。`stage` 将匹配 `PLUGIN_SHA256` 的构建产物复制到 `plugin-releases/`；历史验收目录不变。
 
-macOS 可能要求首次允许新 App 访问外接磁盘；解锁电脑并在真实系统提示中允许后才可继续验证。LaunchAgent 的 `running` 状态不代表 HTTP 已就绪。分别核对 8097 的 `/System/Info/Public`、18783 的 `/readyz` 和 `/v1/models`，再用浏览器验收；整机重启后的顺序仍须另行观察。
+macOS 可能要求首次允许新 App 访问外接磁盘；解锁电脑并在真实系统提示中允许后才可继续验证。LaunchAgent 的 `running` 状态不代表 HTTP 已就绪。核对当前配置端口（正式为 8096）的 `/System/Info/Public`，须包含实际 Version 和 ProductName，不能把数据库升级时的进度响应当作就绪；模型另核对 18783 的 `/readyz` 和 `/v1/models`，再用浏览器验收。整机重启后的顺序仍须另行观察。
 
 ## 切换与回退
 
-切换（第 4 步，待用户试用确认）：
+首次切换步骤（第 4 步，2026-10-18 用户已确认并执行；下面保留为过程记录）。Docker 停用后不再是最新数据来源，后续维护不要重新用它覆盖本机的新记录。
 
 1. 用户先通过与日常入口分开的临时 HTTPS 网址试用 8097，明确验收通过后才能切换。三集搜索、缩略图和定位播放须可用；其他视频仍按名称搜索。
 2. `stop` 本机版，并 `docker stop jellyfin`，让 Docker 数据库静止且释放 8096。用 `migrate --port 8096` 重新迁移最新数据；准备和检查在临时目录完成后才替换 `data`。试用期间本机版的观看记录保留在 `replaced/`，不自动与 Docker 合并。
@@ -77,4 +79,6 @@ macOS 可能要求首次允许新 App 访问外接磁盘；解锁电脑并在真
 4. `start` 本机版，等待数据库升级、全库扫描，再核对账号、条目和观看记录以及三集搜索、普通播放、转码播放。不要用 `install` 代替无变更的正常启动，以免无故重编译 App。
 5. Caddy 的 `jellyfin.home.jattora.com` 后端本来就是 `127.0.0.1:8096`，无须改动。通过日常 HTTPS 入口再次验证后，撤下临时入口；Docker 配置和旧验收数据均保留。
 
-回退：`stop` 本机版，`docker start jellyfin`，核对 8096 和日常入口恢复旧版。若本轮不再试用三集搜索，可另行停止独立查询模型；共享 18780 不动。迁移脚本只读 Docker 配置，不写入源目录。
+本次 Docker 完整备份为 `backups/docker-config-20261018-003533`；带 136 条观看记录的试用数据保留在 `replaced/data-20261018-003533`，正式版沿用 Docker 的 135 条记录，没有自动合并。
+
+回退：先保留当前本机数据，再 `stop` 本机版、`docker start jellyfin`，核对 8096 和日常入口恢复旧版。Docker 配置是切换时的快照，不含切换之后在本机产生的新记录。若不再使用三集搜索，可另行停止独立查询模型；共享 18780 不动。迁移脚本只读 Docker 配置，不写入源目录。
