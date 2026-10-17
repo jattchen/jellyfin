@@ -2,6 +2,7 @@
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import json
 import math
 from pathlib import Path
 import statistics
@@ -185,5 +186,127 @@ class CandidatePool(unittest.TestCase):
                                    'end_ticks': 130_000_000}, source, [1.0] + [0.0] * 767)
 
 
-if __name__ == '__main__':
+class SharedDocumentCache(unittest.TestCase):
+    def signature(self, processing_id="from-live-service"):
+        return {"id": "google/embeddinggemma-2", "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+                "processing_id": processing_id, "dimension": 768, "normalized": True}
+
+    def window(self):
+        return {"version": "10s-8s-5f70-tail-v1", "length_ticks": 100_000_000, "step_ticks": 80_000_000,
+                "sampled_seconds": [0, 2, 4, 6, 8], "fps": 0.5, "max_soft_tokens": 70,
+                "add_timestamps": False, "profile": "jellyfin-10s-5f"}
+
+    def source(self, directory):
+        path = Path(directory) / "film.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"film")
+        stat = path.stat()
+        return {"sourcePath": str(path), "sizeBytes": stat.st_size,
+                "modifiedTicks": stat.st_mtime_ns // 100 + 621355968000000000}
+
+    def payload(self, signature):
+        return {"model": signature["id"], "revision": signature["revision"], "processing_id": signature["processing_id"],
+                "dimension": 768, "normalized": True, "data": [{"index": 0, "embedding": [1.0] + [0.0] * 767,
+                "processing": {"modalities": ["text"], "task": "document"}}]}
+
+    def protocol(self, directory, cache, processing_id="from-live-service", shared=True):
+        body = {"signature": self.signature(processing_id), "source": self.source(directory),
+                "window": self.window(), "embedding_base_url": "http://127.0.0.1:18783",
+                "max_inflight_embeddings": 1}
+        if shared:
+            body["shared_document_cache"] = str(cache)
+        return body
+
+    def entry(self, candidate_id, start):
+        return {"candidate_id": candidate_id, "text": "同一句", "start_ticks": start,
+                "end_ticks": start + 40_000_000}
+
+    def post(self, protocol, entry, payload, posts):
+        class Response:
+            status = 200
+
+            def read(self):
+                return json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def opener(request, timeout=None):
+            posts.append(json.loads(request.data.decode()))
+            return Response()
+
+        with patch.object(embed, "await_idle", lambda *_args, **_kwargs: None), \
+                patch.object(embed.LOCAL_HTTP, "open", opener):
+            return embed.dispatch(Path(protocol["source"]["sourcePath"]).parent, entry, protocol, "text")
+
+    def test_same_text_different_times_posts_once_and_keeps_each_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "shared-document-vectors"
+            first_home, second_home = root / "embed-a", root / "embed-b"
+            first = self.protocol(first_home, cache)
+            second = self.protocol(second_home, cache)
+            left, right = self.entry("c0000-U01", 0), self.entry("c0004-U02", 80_000_000)
+            before = (left["text"], left["start_ticks"], right["text"], right["end_ticks"])
+            self.assertEqual(embed.embedding_input(first, "text", left)[0], embed.embedding_input(second, "text", right)[0])
+            posts = []
+            fresh, _ = self.post(first, left, self.payload(first["signature"]), posts)
+            reused, state = self.post(second, right, self.payload(second["signature"]), posts)
+            self.assertTrue(fresh)
+            self.assertFalse(reused)
+            self.assertEqual(len(posts), 1)
+            self.assertTrue(state["model_input_reused"])
+            self.assertTrue(str(state["reused_from"]).endswith(embed.embedding_input(first, "text", left)[0] + ".json"))
+            own = embed.read(second_home / "text" / "c0004-U02.state.json")
+            self.assertEqual(own["candidate_id"], "c0004-U02")
+            self.assertNotEqual((second_home / "text" / "c0004-U02.state.json").resolve(),
+                                Path(state["reused_from"]).with_suffix(".state.json").resolve())
+            self.assertEqual(before, (left["text"], left["start_ticks"], right["text"], right["end_ticks"]))
+            self.assertFalse((first_home / "text" / "c0000-U01.state.json").read_text().count("model_input_reused"))
+
+    def test_different_signature_is_not_reused_and_unknown_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "shared-document-vectors"
+            home = root / "embed-a"
+            original = self.protocol(home, cache)
+            entry = self.entry("c0000-U01", 0)
+            posts = []
+            self.post(original, entry, self.payload(original["signature"]), posts)
+            other = self.protocol(home, cache, processing_id="other-signature")
+            fresh, state = self.post(other, self.entry("c0009-U01", 10_000_000), self.payload(other["signature"]), posts)
+            self.assertTrue(fresh)
+            self.assertEqual(len(posts), 2)
+            self.assertFalse(state.get("model_input_reused", False))
+            blocked = self.protocol(root / "embed-b", cache)
+            input_hash, _ = embed.embedding_input(blocked, "text", entry)
+            embed.save(cache / (input_hash + ".state.json"),
+                       {"status": "completion-unknown", "input_hash": input_hash})
+            with patch.object(embed.LOCAL_HTTP, "open", side_effect=AssertionError("posted")):
+                with self.assertRaises(RuntimeError) as caught:
+                    embed.dispatch(root / "embed-b", self.entry("c0010-U03", 20_000_000), blocked, "text")
+            self.assertIn("Unresolved shared document", str(caught.exception))
+
+    def test_disabled_cache_posts_every_candidate_and_protected_paths_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "embed-a"
+            protocol = self.protocol(home, root / "unused", shared=False)
+            posts = []
+            self.post(protocol, self.entry("c0000-U01", 0), self.payload(protocol["signature"]), posts)
+            self.post(protocol, self.entry("c0001-U01", 50_000_000), self.payload(protocol["signature"]), posts)
+            self.assertEqual(len(posts), 2)
+            self.assertIsNone(embed.shared_document_directory(protocol))
+            protocol["shared_document_cache"] = "relative-cache"
+            with self.assertRaisesRegex(AssertionError, "absolute directory"):
+                embed.shared_document_directory(protocol)
+            protocol["shared_document_cache"] = str(root / "jellyfin-full-film-20261016" / "shared-document-vectors")
+            with self.assertRaises(AssertionError):
+                embed.dispatch(home, self.entry("c0002-U01", 0), protocol, "text")
+
+
+if __name__ == "__main__":
     unittest.main()

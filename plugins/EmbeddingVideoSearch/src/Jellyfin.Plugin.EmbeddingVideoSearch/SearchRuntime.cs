@@ -668,7 +668,7 @@ public sealed partial class SearchRuntime : IDisposable
             availability = Availability("incompatible", "incompatible");
         }
 
-        return new CapabilitiesResponse
+        var response = new CapabilitiesResponse
         {
             Availability = availability,
             Compatibility = new CompatibilityBody
@@ -696,6 +696,8 @@ public sealed partial class SearchRuntime : IDisposable
             },
             QualityPolicy = Quality()
         };
+        WindowContract.Apply(response.Compatibility, response.Window, active?.WindowVersion);
+        return response;
     }
 
     private AdminStatusResponse BuildAdmin(ModelObservation observation)

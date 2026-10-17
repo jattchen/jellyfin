@@ -36,21 +36,21 @@ def verified_vector(run, entry, protocol, channel):
     response = run / channel / (entry['candidate_id'] + '.json')
     state_path = response.with_suffix('.state.json')
     state = read(state_path)
-    assert state['status'] == 'succeeded' and sha(response) == state['response_sha256']
+    if state.get('status') != 'succeeded':
+        raise RuntimeError('Unresolved prior dispatch; inspect before any retry: ' + str(state_path))
+    assert sha(response) == state['response_sha256']
     expected = protocol['signature']
+    input_hash, window = embedding.embedding_input(
+        protocol, channel, entry, None if channel != 'joint' else read((run / 'clips' / (entry['candidate_id'] + '.mp4')).with_suffix('.clip.json'))['sha256'])
     if channel == 'joint':
         clip_path = run / 'clips' / (entry['candidate_id'] + '.mp4')
         clip_state = read(clip_path.with_suffix('.clip.json'))
         assert sha(clip_path) == clip_state['sha256']
-        expected_input = digest({'clip_sha256': clip_state['sha256'], 'signature': expected,
-                                 'kind': 'joint', 'candidate': entry})
         identity = clip_state['identity']
         assert identity['source'] == embedding.source_facts(protocol['source'])
         assert identity['start_ticks'] == entry['start_ticks'] and identity['end_ticks'] == entry['end_ticks']
-    else:
-        expected_input = digest({'text': entry['text'], 'signature': expected, 'kind': 'document'})
-    assert state['input_hash'] == expected_input, 'Embedding input provenance changed'
-    return f32(embedding.validate_response(read(response), expected, channel))
+    assert state['input_hash'] == input_hash, 'Embedding input provenance changed'
+    return f32(embedding.validate_response(read(response), expected, channel, window))
 
 
 def build_bundle(prior, source, new_candidates, references, query_version, signature):

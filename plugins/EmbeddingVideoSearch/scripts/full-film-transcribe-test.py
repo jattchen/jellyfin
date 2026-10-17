@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import wave
@@ -133,6 +134,79 @@ def align_record(chunk, text, units):
 
 
 class DriverTests(unittest.TestCase):
+    def test_approved_tail_view_keeps_raw_and_enforces_the_narrow_boundary(self):
+        duration = 22.19625
+        count = 355140
+        chunk = {"start_sample": 0, "end_sample": count}
+        body = protocol()
+        body["alignment_time_policy"] = driver.TAIL_TIME_POLICY
+        body["aligner_model_path"] = "/models/" + driver.ALIGNER_REVISION
+        raw = align_record(chunk, "甲管", [
+            {"text": "甲", "start_time": 0.1, "end_time": 1.0},
+            {"text": "管", "start_time": 22.16, "end_time": 22.24},
+        ])
+        raw["model_path"] = body["aligner_model_path"]
+        before = json.dumps(raw, sort_keys=True)
+        self.assertEqual(driver.parse_align_record(raw, "甲管", count, duration), ["last-unit-out-of-bounds"])
+        view, receipt = driver.alignment_view(raw, body, "甲管", count, duration)
+        self.assertEqual(json.dumps(raw, sort_keys=True), before)
+        self.assertEqual(view["units"][-1]["end_time"], duration)
+        self.assertEqual(receipt["end_retracted_ticks"], 437500)
+        self.assertFalse(receipt["transcription_accuracy_verified"])
+        self.assertEqual(driver.parse_align_record(view, "甲管", count, duration), [])
+        self.assertIsNone(driver.alignment_view(raw, protocol(), "甲管", count, duration)[1])
+        for start, end in [(22.16, duration + 0.081), (duration, 22.24), (22.21, 22.24)]:
+            bad = json.loads(before)
+            bad["units"][-1].update(start_time=start, end_time=end)
+            self.assertIsNone(driver.alignment_view(bad, body, "甲管", count, duration)[1])
+        bad = json.loads(before)
+        bad["units"][0]["end_time"] = duration + 0.02
+        self.assertIsNone(driver.alignment_view(bad, body, "甲管", count, duration)[1])
+        bad = json.loads(before)
+        bad["model_path"] = "/models/other"
+        with self.assertRaises(driver.StageBlocked):
+            driver.alignment_view(bad, body, "甲管", count, duration)
+
+    def test_offline_tail_revalidation_preserves_failed_origin_and_no_model_call(self):
+        with tempfile.TemporaryDirectory() as temp:
+            original = Path(temp) / "original"
+            original.mkdir()
+            chunks = write_layout(original, [12 * driver.SAMPLE_RATE])
+            body = driver.load_json(original / "protocol.json")
+            body["aligner_model_path"] = "/models/" + driver.ALIGNER_REVISION
+            save_protocol(original, body)
+            write_asr(original, chunks[0], "甲乙")
+            mark_succeeded(original, "asr", chunks)
+            calls = []
+            def launch(kind, chunk, output, protocol_body):
+                calls.append(kind)
+                record = align_record(chunk, "甲乙", [
+                    {"text": "甲", "start_time": 0.1, "end_time": 1.0},
+                    {"text": "乙", "start_time": 11.96, "end_time": 12.04},
+                ])
+                record["model_path"] = body["aligner_model_path"]
+                driver.save_json(output, record)
+                return {"returncode": 0, "stderr": "", "elapsed_seconds": 0.2}
+            with self.assertRaises(driver.StageBlocked):
+                driver.stage_align(original, launch=launch)
+            original_tasks = (original / "align-tasks.json").read_bytes()
+            raw_hash = driver.file_sha256(original / "align/c0000.json")
+            derived = Path(temp) / "derived"
+            shutil.copytree(original, derived)
+            body["alignment_time_policy"] = driver.TAIL_TIME_POLICY
+            body["recovery_origin"] = {"run": str(original), "align_tasks_sha256": driver.file_sha256(original / "align-tasks.json")}
+            save_protocol(derived, body)
+            driver.stage_revalidate_tail(derived)
+            self.assertEqual(calls, ["align"])
+            self.assertEqual((original / "align-tasks.json").read_bytes(), original_tasks)
+            self.assertEqual(driver.file_sha256(derived / "align/c0000.json"), raw_hash)
+            task = driver.load_json(derived / "align-tasks.json")[0]
+            self.assertEqual(task["original_validation_failure"]["status"], "failed")
+            rows = driver.stage_documents(derived)
+            self.assertEqual("".join(row["text"] for row in rows), "甲乙")
+            self.assertIn("time_boundary_derivation", rows[-1]["provenance"])
+            self.assertLessEqual(rows[-1]["end_ticks"], 120000000)
+
     def test_ffmpeg_targets_protocol_audio_stream(self):
         command = driver.ffmpeg_arguments("/media/film.mp4", 1, "/tmp/full.wav", 12_088_100_000)
         self.assertEqual(command[0], "ffmpeg")
@@ -166,6 +240,23 @@ class DriverTests(unittest.TestCase):
         with self.assertRaises(driver.StageBlocked) as caught:
             driver.verify_pcm_length(19_340_961, 12_088_100_000)
         self.assertIn("不能映射出片外", str(caught.exception))
+
+    def test_fractional_source_runtimes_floor_pcm_without_changing_source_time(self):
+        for runtime, count, remainder in [(17_101_752_380, 27_362_803, 505),
+                                          (11_567_786_670, 18_508_458, 420)]:
+            with self.subTest(runtime=runtime):
+                self.assertEqual(driver.expected_pcm_samples(runtime), count)
+                self.assertEqual(runtime - count * driver.TICKS_PER_SAMPLE, remainder)
+                self.assertEqual(driver.verify_pcm_length(count, runtime)["pcm_minus_expected_samples"], 0)
+                with self.assertRaises(driver.StageBlocked):
+                    driver.verify_pcm_length(count + 1, runtime)
+                command = driver.ffmpeg_arguments("/media/film.mp4", 1, "/tmp/full.wav", runtime)
+                self.assertEqual(command[command.index("-t") + 1],
+                                 driver.format_runtime_seconds(count * driver.TICKS_PER_SAMPLE))
+                self.assertEqual(command[command.index("-af") + 1],
+                                 f"aresample=16000,atrim=end_sample={count}")
+                self.assertNotEqual(driver.format_runtime_seconds(runtime),
+                                    command[command.index("-t") + 1])
 
     def test_worker_command_uses_cap_1024_and_no_draft(self):
         body = protocol()

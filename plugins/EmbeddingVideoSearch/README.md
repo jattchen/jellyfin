@@ -2,7 +2,7 @@
 
 独立 Jellyfin 插件，只针对未改过的官方 **12.2.0**。索引放在宿主 `DataPath/embedding-video-search/8f4c2a91-6d3e-4b7a-9c15-2e8d0f6a4b17/`，不放进插件 DLL 目录，也不写 Jellyfin 核心数据库。
 
-当前这版插件测试是 80 项，都在本目录里跑，另有离线原片重绑定脚本回归。构建时会用到这里的 `global.json`（SDK 10.0.402）：
+当前这版插件测试是 85 项，都在本目录里跑，另有离线原片重绑定脚本回归。构建时会用到这里的 `global.json`（SDK 10.0.402）：
 
 ```bash
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
@@ -21,7 +21,21 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 - `full-film-embed.py --run RUN --stage joint`：先运行joint，再将stage改为text。复核输入/响应哈希和模型签名后复用成功检查点；新请求逐条发送，不自动重试。joint可加 `--prefetch-clips`，最多提前一个CPU切片、2个编码线程，仍只有一个模型请求；text不能加此选项。本机HTTP显式绕过系统代理，避免loopback被代理接管。
 - `full-film-import.py --run RUN --references REFERENCE_CACHE --output NEW_DIRECTORY`：从备份创建全新离线索引，完整校验302个联合窗、文字响应及原16条参考缓存。只替换试点原片的启用候选，保留另两片及旧版本；沿原算法对新候选池生成新曲线，不新增参考query输入。不会写运行中的索引，安装新副本仍需独立验证、备份和停止自有隔离宿主。
 
-ASR/对齐与两路embedding不要同时推理。单片脚本合成检查分别为 `full-film-transcribe-test.py` 的20项（worker Python）和 `full-film-embed-test.py` 的11项（Python3）；不代替真实导入、网页、播放和权限验收。
+ASR/对齐与两路embedding不要同时推理。单片脚本合成检查分别为 `full-film-transcribe-test.py`（worker Python）和 `full-film-embed-test.py`（Python3）。10秒三集另见 `ten-second-contract-test.py`。这些检查不代替真实导入、网页、播放和权限验收。
+
+## 10秒三集，独立新索引
+
+当前三片处理与真实接口证据、质量变化及浏览器待验收项见 [验收记录](../../docs/three-film-10s-acceptance-20261017.md)。
+
+这组脚本只服务新的隔离运行目录，不改6秒成功缓存，也不发布到18096。片与片之间用 `itemId`、`sourcePath`、`contentVersion` 对应。目录名里的 `E2`、`E3` 只是内部代号：`asr-E2` 是网页第3集，`asr-E3` 是网页第2集。报告不要用代号倒推集数。
+
+`ten-second-contract.py interface` 打印协议骨架。`processing_id` 留空，等18783的 `/v1/models` 确认后再写入；脚本不会自己填。模型侧报告过 `eg2-0b01d27c8c20b7d920e5`，仍以启动后的 info 为准。
+
+`ten-second-contract.py plan --protocol embed-protocol.json --dest-root NEW/embed` 按每片真实 `runtimeTicks` 生成10秒窗、8秒步长和贴尾整窗，写到 `embed-<代号>/`，不会写入 `asr-*`。`ten-second-contract.py adopt-transcription --from-run OLD --dest embed-E1 --chunks 65 --documents 147` 只在准备、ASR、对齐、分段全部 `succeeded` 时复制第1集原文；失败、未知或未完成会拒绝，并且不改来源目录。
+
+`full-film-embed.py --run embed-<代号> --stage joint` 看到10秒窗口版本后校验 `sampled_seconds=[0,2,4,6,8]`、`frame_count=5`、`max_soft_tokens=70`、`add_timestamps=false`，不要求 `fps`。音频短于切片超过0.15秒会拒绝。6秒协议仍按原来的 `fps=1` 检查。`--prefetch-clips` 在10秒运行里把同一窗口和源流探测传给切片，仍然最多提前一个；不带窗口参数时仍是原来的6秒切片。文字阶段只有协议显式写了 `shared_document_cache` 目录时，才按现有输入哈希跨片复用已成功的同一句；每条候选仍写自己的状态，并标 `reused_from` 和 `model_input_reused`。未知、失败或已开始的共享记录会停住，不会再请求。目录不要放进旧的6秒运行或 `asr-*`。
+
+`ten-second-import.py --protocol embed-protocol.json --film-run embed-E1 --film-run embed-E2 --film-run embed-E3 --references NEW_QUERY_CACHE --output NEW_INDEX` 新建空索引，服务地址写成 `http://127.0.0.1:18783`。每片的模型签名和窗口必须与根协议一致，而且源必须是根协议里的三片之一、各出现一次。文字编号 `c0000-U01` 会按条目编号分开，原转写文件不改。任一转写或向量不是 `succeeded` 时不会写入。
 
 ## HTTP
 

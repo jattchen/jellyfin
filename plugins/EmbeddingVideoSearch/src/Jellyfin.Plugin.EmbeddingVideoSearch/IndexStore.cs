@@ -614,7 +614,7 @@ public sealed partial class IndexStore : IDisposable
            && stored.Normalized
            && observation.Normalized
            && stored.InputVersion == ApiV1.InputVersion
-           && stored.WindowVersion == ApiV1.WindowVersion
+           && WindowContract.IsAcceptedIndexVersion(stored.WindowVersion)
            && stored.AudioVersion == ApiV1.AudioVersion;
 
     public void Dispose()

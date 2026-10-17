@@ -10,6 +10,7 @@ or start a service.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import importlib.util
@@ -53,6 +54,8 @@ CHUNK_FIELDS = (
     "wav_sha256",
 )
 TIMESTAMP_TOLERANCE_SECONDS = 0.001
+TAIL_TIME_POLICY = "last-unit-tail-80ms-v1"
+ALIGNER_REVISION = "53c8c0e46733eec430e4b53dd6471d0e5dee45f8"
 
 
 class StageBlocked(RuntimeError):
@@ -190,8 +193,10 @@ def format_runtime_seconds(runtime_ticks):
 
 def expected_pcm_samples(runtime_ticks):
     ticks = int(runtime_ticks)
-    if ticks % TICKS_PER_SAMPLE:
-        raise StageBlocked("runtimeTicks 不能换算成整数个 16 kHz 样本")
+    if ticks <= 0:
+        raise StageBlocked("runtimeTicks 必须为正")
+    # A source can end between samples. Retain its true runtime, but never
+    # invent a final sample extending beyond that source boundary.
     return ticks // TICKS_PER_SAMPLE
 
 
@@ -224,7 +229,9 @@ def ffmpeg_arguments(source, audio_stream_index, output, runtime_ticks):
         "-map",
         f"0:{index}",
         "-t",
-        format_runtime_seconds(runtime_ticks),
+        format_runtime_seconds(expected_pcm_samples(runtime_ticks) * TICKS_PER_SAMPLE),
+        "-af",
+        f"aresample={SAMPLE_RATE},atrim=end_sample={expected_pcm_samples(runtime_ticks)}",
         "-ac",
         "1",
         "-ar",
@@ -777,6 +784,46 @@ def out_of_bounds_units(units, duration):
     return found
 
 
+def alignment_view(record, protocol, text, sample_count, duration):
+    """Derive bounded search times; never edit the model response or its words."""
+    policy = protocol.get("alignment_time_policy")
+    if policy is None:
+        return record, None
+    if policy != TAIL_TIME_POLICY:
+        raise StageBlocked("未知对齐时间派生规则")
+    problems = parse_align_record(record, text, sample_count, duration)
+    if problems != ["last-unit-out-of-bounds"]:
+        return record, None
+    units = record["units"]
+    overflow = out_of_bounds_units(units, duration)
+    if len(overflow) != 1 or not overflow[0]["is_last"]:
+        return record, None
+    last = units[-1]
+    start, end = last["start_time"], last["end_time"]
+    if not (0 <= start < duration < end and end - duration <= 0.080 + 1e-12):
+        return record, None
+    model = protocol.get("aligner_model_path", "")
+    if Path(model).name != ALIGNER_REVISION or record.get("model_path") != model:
+        raise StageBlocked("尾点派生只适用于已确认的固定对齐模型")
+    derived = copy.deepcopy(record)
+    derived["units"][-1]["end_time"] = duration
+    if parse_align_record(derived, text, sample_count, duration):
+        raise StageBlocked("尾点派生后仍未通过原1ms时间范围及原文校验")
+    receipt = {
+        "version": TAIL_TIME_POLICY,
+        "unit_index": len(units) - 1,
+        "text": last["text"],
+        "raw_start_seconds": start,
+        "raw_end_seconds": end,
+        "derived_end_seconds": duration,
+        "end_retracted_ticks": int(round((end - duration) * TICKS_PER_SECOND)),
+        "raw_validation_failure": problems,
+        "raw_preserved": True,
+        "transcription_accuracy_verified": False,
+    }
+    return derived, receipt
+
+
 def reuse_succeeded(task, identity, output):
     if task["identity"] != identity:
         raise StageBlocked(f"{task['chunk_id']} 的输入哈希与成功检查点不同，未重新推理")
@@ -791,6 +838,57 @@ def reject_if_blocked(tasks):
         raise StageBlocked(
             f"{blocker.get('chunk_id')} 检查点为 {blocker.get('status')}（{blocker.get('reason')}），未自动重试"
         )
+
+
+def stage_revalidate_tail(run):
+    """Offline validation in a new run; preserve the failed source run intact."""
+    run = Path(run).resolve()
+    lock = acquire_lock(run)
+    try:
+        protocol = load_protocol(run)
+        if protocol.get("alignment_time_policy") != TAIL_TIME_POLICY:
+            raise StageBlocked("未启用用户确认的尾点派生规则")
+        origin = protocol.get("recovery_origin") or {}
+        original = Path(origin.get("run", ".")).resolve()
+        ledger = original / "align-tasks.json"
+        if original == run or not ledger.is_file() or file_sha256(ledger) != origin.get("align_tasks_sha256"):
+            raise StageBlocked("必须在保留原失败记录的新运行目录复核")
+        original_tasks = {task["chunk_id"]: task for task in load_json(ledger)}
+        tasks = load_tasks(run, "align")
+        chunks = {chunk["chunk_id"]: chunk for chunk in load_chunks(run)}
+        changes = []
+        updated = copy.deepcopy(tasks)
+        for task in updated:
+            if task.get("status") == "succeeded":
+                continue
+            source_task = original_tasks.get(task["chunk_id"])
+            if task != source_task or task.get("status") != "failed" or task.get("reason") != "validation:last-unit-out-of-bounds":
+                raise StageBlocked("只离线复核已知且仅末字越界的原失败；未知或其它失败仍停止")
+            chunk = chunks[task["chunk_id"]]
+            text, asr_sha = asr_text_for_chunk(run, chunk)
+            path = output_path(run, "align", chunk["chunk_id"])
+            record = reuse_succeeded(task, align_identity(protocol, chunk, asr_sha), path)
+            view, receipt = alignment_view(record, protocol, text,
+                int(chunk["end_sample"]) - int(chunk["start_sample"]), float(chunk["duration_seconds"]))
+            if receipt is None or parse_align_record(view, text, record["audio_samples"], float(chunk["duration_seconds"])):
+                raise StageBlocked("原失败不满足有限尾点派生条件，未重新推理")
+            task.update(status="succeeded", reason="derived-tail-boundary-validated",
+                        original_validation_failure=source_task, time_boundary_derivation=receipt,
+                        text_sha256=text_sha256(text))
+            changes.append({"chunk_id": task["chunk_id"], "raw_sha256": task["output_sha256"], **receipt})
+        if not changes:
+            raise StageBlocked("没有可离线复核的原失败，不重复执行恢复")
+        save_json(run / "tail-revalidation.json", {
+            "version": TAIL_TIME_POLICY, "origin": origin, "changes": changes,
+            "new_model_inputs": 0, "original_failures_preserved": True,
+        })
+        record_task(run, "align", updated)
+        if file_sha256(ledger) != origin["align_tasks_sha256"]:
+            raise StageBlocked("原失败记录发生变化")
+        print(f"tail revalidation derived={len(changes)} new_model_inputs=0", flush=True)
+        return changes
+    finally:
+        release_lock(lock)
 
 
 def finish_model_task(run, stage, tasks, task, status, reason, outcome, peak, output):
@@ -1009,7 +1107,10 @@ def stage_align(run, launch=None):
                 raise StageBlocked(f"{chunk['chunk_id']} 对齐没有输出，完成状态未知，未自动重试")
             try:
                 record = load_json(destination)
-                problems = parse_align_record(record, text, sample_count, float(chunk["duration_seconds"]))
+                view, receipt = alignment_view(record, protocol, text, sample_count, float(chunk["duration_seconds"]))
+                problems = parse_align_record(view, text, sample_count, float(chunk["duration_seconds"]))
+                if receipt is not None:
+                    task["time_boundary_derivation"] = receipt
                 peak = record.get("mlx_peak_allocated_bytes")
             except Exception as exc:
                 finish_model_task(run, "align", tasks, task, "unknown", "unreadable-output", outcome, None, destination)
@@ -1131,7 +1232,11 @@ def documents_for_chunk(chunk, protocol, asr_text, align_record, asr_sha, align_
         return []
     if align_record.get("alignment_executed") is not True:
         raise StageBlocked(f"{chunk['chunk_id']} 有实质文本但没有对齐")
-    units = align_record["units"]
+    view, boundary = alignment_view(
+        align_record, protocol, asr_text,
+        int(chunk["end_sample"]) - int(chunk["start_sample"]), float(chunk["duration_seconds"]),
+    )
+    units = view["units"]
     overflow = out_of_bounds_units(units, float(chunk["duration_seconds"]))
     if overflow:
         kind = "最后单元越界" if any(item["is_last"] for item in overflow) else "单元越界"
@@ -1208,6 +1313,10 @@ def documents_for_chunk(chunk, protocol, asr_text, align_record, asr_sha, align_
             [index for index in ids if units[index]["start_time"] == units[index]["end_time"]],
             number,
         )
+        if protocol.get("alignment_time_policy"):
+            provenance["alignment_time_policy"] = protocol["alignment_time_policy"]
+        if boundary is not None and boundary["unit_index"] in ids:
+            provenance["time_boundary_derivation"] = boundary
         rows.append(candidate_row(chunk, protocol, asr_text, start, end, low, high, provenance))
     return rows
 
@@ -1268,6 +1377,8 @@ def documents_identity(run, protocol, chunks):
         str(protocol["source"]["runtimeTicks"]),
         str(protocol["source"]["contentVersion"]),
     ]
+    if protocol.get("alignment_time_policy"):
+        parts.append(protocol["alignment_time_policy"])
     for chunk in chunks:
         parts.append(chunk["chunk_id"])
         parts.append(chunk["wav_sha256"])
@@ -1482,7 +1593,7 @@ def worker_align(model, wav, asr_json, output):
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="单片转写、对齐和标点分段")
     parser.add_argument("--run", help="含 protocol.json 的运行目录")
-    parser.add_argument("--stage", choices=("prepare", "asr", "align", "documents"))
+    parser.add_argument("--stage", choices=("prepare", "asr", "align", "documents", "revalidate-tail"))
     parser.add_argument("--worker", choices=("asr", "align"), help=argparse.SUPPRESS)
     parser.add_argument("--model", help=argparse.SUPPRESS)
     parser.add_argument("--wav", help=argparse.SUPPRESS)
@@ -1516,6 +1627,8 @@ def main(argv=None):
             stage_asr(args.run)
         elif args.stage == "align":
             stage_align(args.run)
+        elif args.stage == "revalidate-tail":
+            stage_revalidate_tail(args.run)
         else:
             stage_documents(args.run)
     except StageBlocked as exc:

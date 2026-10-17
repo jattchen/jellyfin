@@ -14,26 +14,29 @@ public readonly record struct WindowSpan(long StartTicks, long EndTicks);
 public static class WindowPlanner
 {
     public static IReadOnlyList<WindowSpan> Plan(long durationTicks)
+        => Plan(durationTicks, ApiV1.WindowTicks, ApiV1.StepTicks);
+
+    public static IReadOnlyList<WindowSpan> Plan(long durationTicks, long windowTicks, long stepTicks)
     {
         if (durationTicks <= 0)
         {
             return [];
         }
 
-        if (durationTicks <= ApiV1.WindowTicks)
+        if (durationTicks <= windowTicks)
         {
             return [new WindowSpan(0, durationTicks)];
         }
 
         var windows = new List<WindowSpan>();
         var start = 0L;
-        while (start + ApiV1.WindowTicks < durationTicks)
+        while (start + windowTicks < durationTicks)
         {
-            windows.Add(new WindowSpan(start, start + ApiV1.WindowTicks));
-            start += ApiV1.StepTicks;
+            windows.Add(new WindowSpan(start, start + windowTicks));
+            start += stepTicks;
         }
 
-        var tailStart = durationTicks - ApiV1.WindowTicks;
+        var tailStart = durationTicks - windowTicks;
         if (windows.Count == 0 || windows[^1].StartTicks != tailStart)
         {
             windows.Add(new WindowSpan(tailStart, durationTicks));

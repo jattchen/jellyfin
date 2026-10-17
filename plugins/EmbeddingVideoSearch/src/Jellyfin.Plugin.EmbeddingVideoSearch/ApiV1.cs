@@ -9,11 +9,14 @@ public static class ApiV1
     public const long TicksPerSecond = 10_000_000L;
     public const long WindowTicks = 6 * TicksPerSecond;
     public const long StepTicks = 4 * TicksPerSecond;
+    public const long TenSecondWindowTicks = 10 * TicksPerSecond;
+    public const long TenSecondStepTicks = 8 * TicksPerSecond;
     public const int Dimension = 768;
     public const string ModelId = "google/embeddinggemma-2";
     public const string Revision = "914f7f89142e33e77833254d9c9b90c3cef7303b";
     public const string InputVersion = FfmpegWindowClipper.InputVersion;
     public const string WindowVersion = "6s-4s-tail-v1";
+    public const string TenSecondWindowVersion = "10s-8s-5f70-tail-v1";
     public const string AudioVersion = FfmpegWindowClipper.AudioVersion;
     public const double DefaultRelatedMinimum = 0.35;
     public const int DefaultLimit = 24;

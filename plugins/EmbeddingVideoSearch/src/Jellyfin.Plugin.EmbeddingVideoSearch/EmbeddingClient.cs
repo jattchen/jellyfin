@@ -27,6 +27,20 @@ public sealed class WindowProcessing
     public double? VideoDurationSeconds { get; init; }
     public bool? AudioIncluded { get; init; }
     public double? AudioDurationSeconds { get; init; }
+    public int[]? SampledSeconds { get; init; }
+    public int? FrameCount { get; init; }
+    public int? MaxSoftTokens { get; init; }
+    public bool? AddTimestamps { get; init; }
+    public string? Profile { get; init; }
+    public bool? HasAudio { get; init; }
+    public string? OverflowStrategy { get; init; }
+    public int[]? OffsetSeconds { get; init; }
+    public int? WindowSeconds { get; init; }
+    public bool FpsDeclared { get; init; }
+    public int? SampleRate { get; init; }
+    public int? Channels { get; init; }
+    public bool? AudioTruncated { get; init; }
+    public string? AudioCoverage { get; init; }
 }
 
 public sealed class EmbeddingCall
@@ -233,6 +247,16 @@ public sealed class HttpEmbeddingClient : IEmbeddingClient
         double? videoDuration = null;
         bool? audioIncluded = null;
         double? audioDuration = null;
+        int[]? sampledSeconds = null;
+        int? frameCount = null;
+        int? maxSoftTokens = null;
+        bool? addTimestamps = null;
+        string? profile = null;
+        bool? hasAudio = null;
+        string? overflow = null;
+        int[]? offsets = null;
+        int? windowSeconds = null;
+        var fpsDeclared = false;
         if (processing.TryGetProperty("video", out var video))
         {
             if (video.TryGetProperty("duration_seconds", out var duration) && duration.TryGetDouble(out var seconds))
@@ -244,19 +268,122 @@ public sealed class HttpEmbeddingClient : IEmbeddingClient
             {
                 audioIncluded = included.GetBoolean();
             }
+
+            if (video.TryGetProperty("sampled_seconds", out var sampled) && sampled.ValueKind == JsonValueKind.Array)
+            {
+                sampledSeconds = ReadIntArray(sampled);
+            }
+
+            if (video.TryGetProperty("max_soft_tokens", out var tokens) && tokens.TryGetInt32(out var tokenCount))
+            {
+                maxSoftTokens = tokenCount;
+            }
+
+            if (video.TryGetProperty("add_timestamps", out var stamps) && stamps.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                addTimestamps = stamps.GetBoolean();
+            }
+
+            if (video.TryGetProperty("profile", out var profileElement) && profileElement.ValueKind == JsonValueKind.String)
+            {
+                profile = profileElement.GetString();
+            }
+
+            if (video.TryGetProperty("frame_count", out var frames) && frames.TryGetInt32(out var frameValue))
+            {
+                frameCount = frameValue;
+            }
+
+            if (video.TryGetProperty("has_audio", out var hasAudioElement) && hasAudioElement.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                hasAudio = hasAudioElement.GetBoolean();
+            }
+
+            if (video.TryGetProperty("overflow_strategy", out var overflowElement) && overflowElement.ValueKind == JsonValueKind.String)
+            {
+                overflow = overflowElement.GetString();
+            }
+
+            if (video.TryGetProperty("offsets_seconds", out var offsetElement) && offsetElement.ValueKind == JsonValueKind.Array)
+            {
+                offsets = ReadIntArray(offsetElement);
+            }
+
+            if (video.TryGetProperty("window_seconds", out var windowElement) && windowElement.TryGetInt32(out var windowValue))
+            {
+                windowSeconds = windowValue;
+            }
+
+            if (video.TryGetProperty("fps", out _))
+            {
+                fpsDeclared = true;
+            }
         }
 
-        if (processing.TryGetProperty("audio", out var audio) && audio.TryGetProperty("duration_seconds", out var audioSeconds) && audioSeconds.TryGetDouble(out var audioValue))
+        int? sampleRate = null;
+        int? channels = null;
+        bool? truncated = null;
+        string? coverage = null;
+        if (processing.TryGetProperty("audio", out var audio))
         {
-            audioDuration = audioValue;
+            if (audio.TryGetProperty("duration_seconds", out var audioSeconds) && audioSeconds.TryGetDouble(out var audioValue))
+            {
+                audioDuration = audioValue;
+            }
+
+            if (audio.TryGetProperty("sample_rate", out var rate) && rate.TryGetInt32(out var rateValue))
+            {
+                sampleRate = rateValue;
+            }
+
+            if (audio.TryGetProperty("channels", out var channelElement) && channelElement.TryGetInt32(out var channelValue))
+            {
+                channels = channelValue;
+            }
+
+            if (audio.TryGetProperty("truncated", out var truncatedElement) && truncatedElement.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                truncated = truncatedElement.GetBoolean();
+            }
+
+            if (audio.TryGetProperty("coverage", out var coverageElement) && coverageElement.ValueKind == JsonValueKind.String)
+            {
+                coverage = coverageElement.GetString();
+            }
         }
 
         return new WindowProcessing
         {
             VideoDurationSeconds = videoDuration,
             AudioIncluded = audioIncluded,
-            AudioDurationSeconds = audioDuration
+            AudioDurationSeconds = audioDuration,
+            SampledSeconds = sampledSeconds,
+            FrameCount = frameCount,
+            MaxSoftTokens = maxSoftTokens,
+            AddTimestamps = addTimestamps,
+            Profile = profile,
+            HasAudio = hasAudio,
+            OverflowStrategy = overflow,
+            OffsetSeconds = offsets,
+            WindowSeconds = windowSeconds,
+            FpsDeclared = fpsDeclared,
+            SampleRate = sampleRate,
+            Channels = channels,
+            AudioTruncated = truncated,
+            AudioCoverage = coverage
         };
+    }
+
+    private static int[] ReadIntArray(JsonElement array)
+    {
+        var values = new int[array.GetArrayLength()];
+        var index = 0;
+        foreach (var value in array.EnumerateArray())
+        {
+            values[index++] = value.GetInt32();
+        }
+
+        return values;
     }
 
     public static ModelObservation ParseModels(string json)
