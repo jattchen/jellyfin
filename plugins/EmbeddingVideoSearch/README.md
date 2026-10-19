@@ -2,7 +2,7 @@
 
 独立 Jellyfin 插件，只针对未改过的官方 **12.2.0**。索引放在宿主 `DataPath/embedding-video-search/8f4c2a91-6d3e-4b7a-9c15-2e8d0f6a4b17/`，不放进插件 DLL 目录，也不写 Jellyfin 核心数据库。
 
-当前这版插件测试是 87 项，都在本目录里跑，另有离线原片重绑定脚本回归。构建时会用到这里的 `global.json`（SDK 10.0.402）：
+当前这版插件测试是 91 项，都在本目录里跑，另有离线原片重绑定脚本回归。构建时会用到这里的 `global.json`（SDK 10.0.402）：
 
 ```bash
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
@@ -36,6 +36,17 @@ ASR/对齐与两路embedding不要同时推理。单片脚本合成检查分别�
 `full-film-embed.py --run embed-<代号> --stage joint` 看到10秒窗口版本后校验 `sampled_seconds=[0,2,4,6,8]`、`frame_count=5`、`max_soft_tokens=70`、`add_timestamps=false`，不要求 `fps`。音频短于切片超过0.15秒会拒绝。6秒协议仍按原来的 `fps=1` 检查。`--prefetch-clips` 在10秒运行里把同一窗口和源流探测传给切片，仍然最多提前一个；不带窗口参数时仍是原来的6秒切片。文字阶段只有协议显式写了 `shared_document_cache` 目录时，才按现有输入哈希跨片复用已成功的同一句；每条候选仍写自己的状态，并标 `reused_from` 和 `model_input_reused`。未知、失败或已开始的共享记录会停住，不会再请求。目录不要放进旧的6秒运行或 `asr-*`。
 
 `ten-second-import.py --protocol embed-protocol.json --film-run embed-E1 --film-run embed-E2 --film-run embed-E3 --references NEW_QUERY_CACHE --output NEW_INDEX` 新建空索引，服务地址写成 `http://127.0.0.1:18783`。每片的模型签名和窗口必须与根协议一致，而且源必须是根协议里的三片之一、各出现一次。文字编号 `c0000-U01` 会按条目编号分开，原转写文件不改。任一转写或向量不是 `succeeded` 时不会写入。
+
+## 12秒样本，复制空索引模板
+
+实际样本、检索与浏览器验证见 [C 方案样本记录](../../docs/issue3-c-sample-acceptance-20261019.md)。此阶段仍是少量样本，等待用户验收后再决定扩展范围。
+
+这组命令只服务 `12s-10s-4f70-tail-v1` / `jellyfin-12s-4f`。6秒和10秒脚本保持原样。`shared_document_cache` 可以写在根协议和每片协议里，目录必须相同；它不进入联合窗或文字的输入哈希。相同原文可以复用已成功的文字响应。导入不重新编码。
+
+`sample-c-import.py --protocol embeddings/protocol.json --film-run embeddings/embed-C1 --film-run embeddings/embed-C2 --film-run embeddings/embed-C3 --references reference16 --template COPIED_EMPTY_INDEX.template.db --output NEW_DIRECTORY` 把停掉宿主之后的空索引副本复制到新目录。模板里的媒体、窗口、签名和候选必须是空的，`manual_pause` 与 `imported_candidates_only` 为 1，模型地址为 `http://127.0.0.1:18784`。产物里每片都是 `partial`，时间用原片绝对位置，旧的三集条目不会写入。脚本拒绝直接打开正在运行的宿主索引。
+
+样本协议可设置 `transcription_language_policy: "auto-v1"`：ASR 自动识别每个音频块的语言，对齐使用该块实际检测到的语言，不回退中文。ASR 支持 30 种语言，对齐支持中文、粤语、英语、法语、德语、意大利语、日语、韩语、葡萄牙语、俄语和西班牙语；有文字但语言未知、不受支持或同一块出现多种语言时停止。日语分词依赖 `nagisa`，韩语依赖 `soynlp`，使用前应在独立 worker 环境验证依赖。成功的空转写保留明确检查记录，不生成文字向量；音画候选仍可搜索。缺省不设置该字段时保留原强制中文行为。两种策略的检查点不互用。原语文字保留原样，中文跨语言检索效果需要另行实测。
+
 
 ## HTTP
 
