@@ -28,6 +28,7 @@ FILM_VERSION = "issue3-yuanying-film-v1"
 ASR_VERSION = "issue3-yuanying-asr-v1"
 EXPECTED_PROCESSING_ID = "eg2-7c43611ad2e20661c3d3"
 LANGUAGE_POLICY = "auto-v1"
+UNSUPPORTED_ALIGN_SKIP_POLICY = "unsupported-align-language-skip-v1"
 MODEL_CONCURRENCY = 1
 TRANSCRIBE_STAGES = ("prepare", "asr", "align", "documents")
 EMBED_STAGES = ("joint", "text")
@@ -222,6 +223,9 @@ def require_config(config):
         raise BatchBlocked("model concurrency must stay 1", reason="concurrency")
     if config.get("transcriptionLanguagePolicy", LANGUAGE_POLICY) != LANGUAGE_POLICY:
         raise BatchBlocked("language policy must stay auto-v1", reason="language-policy")
+    skip_policy = config.get("unsupportedAlignLanguagePolicy", None)
+    if skip_policy not in (None, "", UNSUPPORTED_ALIGN_SKIP_POLICY):
+        raise BatchBlocked("unknown unsupported align language policy", reason="language-policy")
     for key in ("sourceDirectory", "sourceFacts", "outputRoot", "workerPython", "asrModel", "alignerModel"):
         if not config.get(key):
             raise BatchBlocked("config missing " + key, reason="config")
@@ -336,7 +340,7 @@ def build_film_record(index, fact, config):
 
 
 def root_protocol(config, films):
-    return {
+    protocol = {
         "version": BATCH_VERSION,
         "fullFilm": True,
         "coverage": "pending",
@@ -348,10 +352,13 @@ def root_protocol(config, films):
         "sampleReuse": {"policy": "explicit-equivalence-v1", "forgedInputHash": False},
         "films": films,
     }
+    if config.get("unsupportedAlignLanguagePolicy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
+        protocol["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
+    return protocol
 
 
 def asr_protocol(record, config):
-    return {
+    protocol = {
         "version": ASR_VERSION,
         "fullFilm": True,
         "coverage": "pending",
@@ -364,6 +371,9 @@ def asr_protocol(record, config):
         "aligner_model_path": str(config["alignerModel"]),
         "source": record["source"],
     }
+    if config.get("unsupportedAlignLanguagePolicy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
+        protocol["unsupported_align_language_policy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
+    return protocol
 
 
 def embed_protocol(record, config, output_root):
@@ -623,7 +633,89 @@ def audit_sample_root(output_root, sample_root):
     return summary
 
 
-def next_transcription_action(checkpoints):
+def allowed_align_skip(task, protocol):
+    protocol = protocol or {}
+    return (
+        protocol.get("unsupported_align_language_policy") == UNSUPPORTED_ALIGN_SKIP_POLICY
+        and isinstance(task, dict)
+        and task.get("status") == "skipped"
+        and task.get("reason") == "language-unsupported"
+        and task.get("skip_policy") == UNSUPPORTED_ALIGN_SKIP_POLICY
+        and task.get("alignment_executed") is False
+    )
+
+
+def public_gap(gap, label):
+    return {
+        "label": label,
+        "chunk_id": gap.get("chunk_id"),
+        "start_ticks": gap.get("start_ticks"),
+        "end_ticks": gap.get("end_ticks"),
+        "reason": gap.get("reason"),
+        "detected_language": gap.get("detected_language"),
+        "skip_policy": gap.get("skip_policy"),
+        "alignment_executed": False,
+        "text_retained": True,
+        "input_text_sha256": gap.get("input_text_sha256"),
+    }
+
+
+def language_gaps(asr_run, protocol):
+    """Public gap rows. The private gap file may hold text; this result does not."""
+    protocol = protocol or {}
+    policy = protocol.get("unsupported_align_language_policy")
+    if policy not in (None, "", UNSUPPORTED_ALIGN_SKIP_POLICY):
+        raise BatchBlocked("unknown unsupported align language policy", reason="language-policy")
+    path = Path(asr_run) / "align-language-gaps.json"
+    documents = Path(asr_run) / "documents-state.json"
+    documents_done = documents.is_file() and read_json(documents).get("status") == "succeeded"
+    if not path.is_file():
+        if documents_done and policy == UNSUPPORTED_ALIGN_SKIP_POLICY:
+            raise BatchBlocked("skip policy requires an align language gap record", reason="transcription-failed")
+        return []
+    if policy != UNSUPPORTED_ALIGN_SKIP_POLICY:
+        raise BatchBlocked("language gaps without the skip policy", reason="language-policy")
+    gaps = read_json(path)
+    if not isinstance(gaps, list):
+        raise BatchBlocked("language gaps must be a list", reason="transcription-failed")
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            raise BatchBlocked("language gap is not a record", reason="transcription-failed")
+        if (
+            gap.get("reason") != "language-unsupported"
+            or gap.get("alignment_executed") is not False
+            or gap.get("embed") is not False
+            or gap.get("skip_policy") != UNSUPPORTED_ALIGN_SKIP_POLICY
+            or gap.get("text_retained") is not True
+            or not gap.get("chunk_id")
+            or not gap.get("input_text_sha256")
+        ):
+            raise BatchBlocked("language gap is not an explicit unsupported-language skip", reason="transcription-failed")
+    if documents_done:
+        state = read_json(documents)
+        expected = "gapped" if gaps else "full"
+        if state.get("text_coverage") != expected or int(state.get("gap_count", -1)) != len(gaps):
+            raise BatchBlocked("language gap record does not match the documents checkpoint", reason="transcription-failed")
+    return [public_gap(gap, Path(asr_run).parent.name) for gap in gaps]
+
+
+def film_settled(assessed):
+    if assessed.get("blocked"):
+        return False
+    action = assessed.get("nextAction") or {}
+    if action.get("action") != "done":
+        return False
+    if assessed.get("coverage") == "full":
+        return True
+    return (
+        assessed.get("coverage") == "gapped"
+        and assessed.get("audioVisualCoverage") == "full"
+        and assessed.get("textCoverage") == "gapped"
+        and bool(assessed.get("gaps"))
+    )
+
+
+def next_transcription_action(checkpoints, protocol=None):
     prepare = checkpoints.get("prepare")
     if prepare is None:
         return {"action": "run", "stage": "prepare"}
@@ -643,6 +735,8 @@ def next_transcription_action(checkpoints):
             seen.append(chunk_id)
             status = task.get("status")
             if status != "succeeded":
+                if stage == "align" and allowed_align_skip(task, protocol):
+                    continue
                 if status == "started":
                     reason = "interrupted-not-retried"
                 elif status in UNKNOWN_STATUSES:
@@ -722,27 +816,44 @@ def publish_transcription(asr_run, embed_run):
     protocol = read_json(asr_run / "protocol.json")
     if protocol.get("fullFilm") is not True or protocol.get("transcription_language_policy") != LANGUAGE_POLICY:
         raise BatchBlocked("transcription protocol is not a whole-film auto pass", reason="not-full-film")
-    action = next_transcription_action(load_checkpoints(asr_run))
+    action = next_transcription_action(load_checkpoints(asr_run), protocol)
     if action["action"] != "done":
         raise BatchBlocked("transcription is not complete", reason=action.get("reason") or "transcription-failed", status=action.get("status"))
     candidates = read_json(asr_run / "candidates.json")
     if not isinstance(candidates, list):
         raise BatchBlocked("candidates must be a list", reason="transcription-failed")
+    gaps = language_gaps(asr_run, protocol)
+    gap_ids = {gap["chunk_id"] for gap in gaps}
     for task_file in ("asr-tasks.json", "align-tasks.json"):
         for task in read_json(asr_run / task_file):
-            if task.get("status") != "succeeded":
-                raise BatchBlocked("failed transcription cannot be published as empty", reason="transcription-failed", status=task.get("status"))
+            if task.get("status") == "succeeded":
+                continue
+            if task_file == "align-tasks.json" and allowed_align_skip(task, protocol) and task.get("chunk_id") in gap_ids:
+                continue
+            raise BatchBlocked("failed transcription cannot be published as empty", reason="transcription-failed", status=task.get("status"))
+    skipped = [
+        task.get("chunk_id")
+        for task in read_json(asr_run / "align-tasks.json")
+        if task.get("status") != "succeeded"
+    ]
+    if set(skipped) != gap_ids:
+        raise BatchBlocked("language gaps do not match the skipped chunks", reason="transcription-failed")
     check = {
         "status": "succeeded",
         "fullFilm": True,
         "coverage": "transcription-complete",
         "candidateCount": len(candidates),
-        "successfulEmpty": len(candidates) == 0,
+        "successfulEmpty": len(candidates) == 0 and not gaps,
+        "textCoverage": "gapped" if gaps else "full",
+        "gapCount": len(gaps),
+        "gaps": gaps,
         "itemId": contract.canonical_item(protocol["source"]["itemId"]),
         "contentVersion": protocol["source"]["contentVersion"],
         "runtimeTicks": int(protocol["source"]["runtimeTicks"]),
         "languagePolicy": LANGUAGE_POLICY,
     }
+    if protocol.get("unsupported_align_language_policy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
+        check["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
     write_json(embed_run / "candidates.json", candidates)
     write_json(embed_run / "transcription-check.json", check)
     if snapshot_tree(asr_run) != before:
@@ -754,6 +865,7 @@ def assess_film(film_dir):
     film_dir = Path(film_dir)
     result = {
         "coverage": "pending", "fullFilm": False, "blocked": False, "successfulEmpty": False,
+        "audioVisualCoverage": "pending", "textCoverage": "pending", "gaps": [],
         "reason": None, "status": None, "stage": "prepare",
         "nextAction": {"action": "run", "stage": "prepare"}, "windows": 0, "documents": 0,
     }
@@ -767,7 +879,7 @@ def assess_film(film_dir):
     if asr_body.get("fullFilm") is not True:
         result.update(coverage="failed", reason="not-full-film", stage="asr", blocked=True)
         return result
-    action = next_transcription_action(load_checkpoints(film_dir / "asr"))
+    action = next_transcription_action(load_checkpoints(film_dir / "asr"), asr_body)
     if action["action"] == "blocked":
         coverage = "failed" if action["reason"] == "transcription-failed" else "blocked"
         result.update(coverage=coverage, blocked=True, reason=action["reason"], status=action.get("status"),
@@ -782,8 +894,16 @@ def assess_film(film_dir):
                       nextAction={"action": "blocked", "stage": "documents"})
         return result
     candidates = read_json(candidates_path)
+    try:
+        gaps = language_gaps(film_dir / "asr", asr_body)
+    except BatchBlocked as exc:
+        result.update(coverage="failed", reason=exc.reason, stage="documents", blocked=True,
+                      nextAction={"action": "blocked", "stage": "documents"})
+        return result
     result["documents"] = len(candidates)
-    result["successfulEmpty"] = len(candidates) == 0
+    result["gaps"] = gaps
+    result["textCoverage"] = "gapped" if gaps else "pending"
+    result["successfulEmpty"] = len(candidates) == 0 and not gaps
     embed_protocol_path = film_dir / "embed" / "protocol.json"
     if not embed_protocol_path.is_file():
         result.update(stage="publish-transcription", nextAction={"action": "run", "stage": "publish-transcription"})
@@ -810,14 +930,21 @@ def assess_film(film_dir):
     if check.get("status") != "succeeded" or check.get("fullFilm") is not True or int(check.get("candidateCount", -1)) != len(candidates):
         result.update(coverage="failed", reason="transcription-failed", stage="documents", blocked=True, successfulEmpty=False)
         return result
-    if len(candidates) == 0 and check.get("successfulEmpty") is not True:
+    if gaps and (check.get("successfulEmpty") is True or check.get("textCoverage") != "gapped"):
+        result.update(coverage="failed", reason="empty-not-successful", stage="documents", blocked=True, successfulEmpty=False)
+        return result
+    if not gaps and check.get("textCoverage") == "gapped":
+        result.update(coverage="failed", reason="transcription-failed", stage="documents", blocked=True, successfulEmpty=False)
+        return result
+    if len(candidates) == 0 and check.get("successfulEmpty") is not True and not gaps:
         result.update(coverage="failed", reason="empty-not-successful", stage="documents", blocked=True, successfulEmpty=False)
         return result
     embed_run = film_dir / "embed"
     for entry in windows:
         state = state_for(embed_run, "joint", entry)
         if state is None:
-            result.update(stage="joint", nextAction={"action": "run", "stage": "joint"}, successfulEmpty=len(candidates) == 0)
+            result.update(stage="joint", nextAction={"action": "run", "stage": "joint"},
+                          successfulEmpty=len(candidates) == 0 and not gaps)
             return result
         if state.get("status") != "succeeded":
             result.update(coverage="blocked", blocked=True, reason="not-succeeded", status=state.get("status"),
@@ -828,6 +955,7 @@ def assess_film(film_dir):
             result.update(coverage="blocked", blocked=True, reason="cache-hash-mismatch", stage="joint",
                           nextAction={"action": "blocked", "stage": "joint"}, successfulEmpty=False)
             return result
+    result["audioVisualCoverage"] = "full"
     if candidates:
         for entry in candidates:
             state = state_for(embed_run, "text", entry)
@@ -842,15 +970,21 @@ def assess_film(film_dir):
                 result.update(coverage="blocked", blocked=True, reason="cache-hash-mismatch", stage="text",
                               nextAction={"action": "blocked", "stage": "text"}, successfulEmpty=False)
                 return result
-    result.update(coverage="full", fullFilm=True, successfulEmpty=len(candidates) == 0,
-                  nextAction={"action": "done", "stage": "import"}, stage="import", reason=None)
+    result["audioVisualCoverage"] = "full"
+    if gaps:
+        result.update(coverage="gapped", fullFilm=True, successfulEmpty=False, textCoverage="gapped",
+                      nextAction={"action": "done", "stage": "import"}, stage="import",
+                      reason="language-unsupported")
+    else:
+        result.update(coverage="full", fullFilm=True, successfulEmpty=len(candidates) == 0, textCoverage="full",
+                      nextAction={"action": "done", "stage": "import"}, stage="import", reason=None)
     return result
 
 
 def step_film(film_dir, *, execute, send):
     assessed = assess_film(film_dir)
     action = assessed["nextAction"]
-    if assessed["coverage"] == "full" or action["action"] != "run":
+    if film_settled(assessed) or action["action"] != "run":
         return assessed
     stage = action["stage"]
     if stage in TRANSCRIBE_STAGES:
@@ -1097,6 +1231,8 @@ def preflight(config, *, check_model=False):
         "languagePolicy": LANGUAGE_POLICY,
         "catalog": public_films,
     }
+    if config.get("unsupportedAlignLanguagePolicy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
+        summary["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
     if ready:
         write_json(Path(config["outputRoot"]) / "preflight.json", summary)
     return summary
@@ -1112,6 +1248,9 @@ def status_summary(output_root):
             "label": record["label"],
             "itemId": record["itemId"],
             "coverage": assessed["coverage"],
+            "audioVisualCoverage": assessed["audioVisualCoverage"],
+            "textCoverage": assessed["textCoverage"],
+            "gaps": assessed["gaps"],
             "fullFilm": assessed["fullFilm"],
             "stage": assessed["stage"],
             "reason": assessed["reason"],
@@ -1123,14 +1262,24 @@ def status_summary(output_root):
     full = sum(1 for film in films if film["coverage"] == "full")
     failed = sum(1 for film in films if film["coverage"] == "failed")
     blocked = sum(1 for film in films if film["coverage"] == "blocked")
+    gapped = sum(1 for film in films if film["coverage"] == "gapped")
+    if films and full == len(films):
+        coverage = "full"
+    elif films and gapped and full + gapped == len(films):
+        coverage = "gapped"
+    else:
+        coverage = "pending"
     summary = {
         "ready": True,
         "total": len(films),
         "full": full,
         "failed": failed,
         "blocked": blocked,
-        "pending": len(films) - full - failed - blocked,
-        "coverage": "full" if films and full == len(films) else "pending",
+        "textGapped": gapped,
+        "audioVisualFull": sum(1 for film in films if film["audioVisualCoverage"] == "full"),
+        "pending": len(films) - full - failed - blocked - gapped,
+        "coverage": coverage,
+        "gaps": [gap for film in films for gap in film["gaps"]],
         "films": films,
         "modelConcurrency": MODEL_CONCURRENCY,
     }
@@ -1138,7 +1287,19 @@ def status_summary(output_root):
     return summary
 
 
-def run_batch(config, *, execute=None, send=None):
+def selected_records(manifest, labels):
+    films = list(manifest["films"])
+    if not labels:
+        return films
+    known = {film["label"] for film in films}
+    missing = [label for label in labels if label not in known]
+    if missing:
+        raise BatchBlocked("unknown film label", reason="config", label=missing[0])
+    chosen = set(labels)
+    return [film for film in films if film["label"] in chosen]
+
+
+def run_batch(config, *, execute=None, send=None, only_labels=None):
     summary = preflight(config, check_model=False)
     if not summary["ready"]:
         return 1, summary
@@ -1153,12 +1314,12 @@ def run_batch(config, *, execute=None, send=None):
     manifest = read_json(output / "manifest.json")
     stopped = None
     stop_kind = None
-    for record in manifest["films"]:
+    for record in selected_records(manifest, only_labels):
         film_dir = output / "films" / record["label"]
         for _step in range(12):
             assessed = assess_film(film_dir)
             action = assessed["nextAction"]
-            if assessed["coverage"] == "full" or action["action"] != "run":
+            if film_settled(assessed) or action["action"] != "run":
                 if assessed["blocked"]:
                     stopped = record["label"]
                     stop_kind = "unknown" if unknown_stop(assessed) else "ordinary"
@@ -1193,7 +1354,7 @@ def run_batch(config, *, execute=None, send=None):
                 break
         if stopped:
             break
-        if assess_film(film_dir)["coverage"] != "full":
+        if not film_settled(assess_film(film_dir)):
             stopped = record["label"]
             stop_kind = "ordinary"
             break
@@ -1204,13 +1365,16 @@ def run_batch(config, *, execute=None, send=None):
             progress["coverage"] = "pending"
         write_json(output / "progress.json", progress)
         return (3 if stop_kind == "unknown" else 2), progress
-    if progress["full"] != progress["total"]:
+    if progress.get("coverage") != "full":
         return 2, progress
     return 0, progress
 
 
 def load_film_rows(film_dir, root_signature):
     assessed = assess_film(film_dir)
+    if assessed.get("textCoverage") == "gapped" or assessed.get("gaps"):
+        raise BatchBlocked("a text gap is not complete coverage", reason="coverage-incomplete",
+                           status=assessed["status"], stage=assessed["stage"], label=Path(film_dir).name)
     if assessed["coverage"] != "full" or assessed["fullFilm"] is not True:
         raise BatchBlocked("film is not a completed whole-film coverage", reason=assessed["reason"] or "coverage-incomplete",
                            status=assessed["status"], stage=assessed["stage"], label=Path(film_dir).name)
@@ -1439,7 +1603,7 @@ def command_preflight(args):
 
 
 def command_run(args):
-    code, summary = run_batch(load_config(args.config))
+    code, summary = run_batch(load_config(args.config), only_labels=args.film or None)
     print(json.dumps(public_value(summary), ensure_ascii=False, indent=2))
     return code
 
@@ -1471,8 +1635,9 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
     preflight_parser = sub.add_parser("preflight", parents=[common])
     preflight_parser.add_argument("--check-model", action="store_true")
-    sub.add_parser("run", parents=[common])
-    sub.add_parser("resume", parents=[common])
+    for name in ("run", "resume"):
+        command = sub.add_parser(name, parents=[common])
+        command.add_argument("--film", action="append", default=[], help="只进入这些片，例如 F006。失败仍会停住。")
     sub.add_parser("status", parents=[common])
     import_parser = sub.add_parser("import", parents=[common])
     import_parser.add_argument("--output", type=Path)

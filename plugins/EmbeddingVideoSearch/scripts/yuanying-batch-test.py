@@ -988,5 +988,158 @@ class PrepareAndImport(unittest.TestCase):
         return film_dir, output, config
 
 
+class LanguageGapAndSelection(unittest.TestCase):
+    def film_config(self, root, output, count=1):
+        rows = []
+        for index in range(count):
+            label = f"F{index + 1:03d}"
+            rows.append(source_file(root / "media", f"film-{label}.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label=label))
+        return config_for(root, rows, output)
+
+    def settle_gap(self, output):
+        film = output / "films" / "F001"
+        protocol = batch.read_json(film / "asr" / "protocol.json")
+        protocol["unsupported_align_language_policy"] = batch.UNSUPPORTED_ALIGN_SKIP_POLICY
+        batch.write_json(film / "asr" / "protocol.json", protocol)
+        batch.write_json(film / "asr" / "prepare.json", {"status": "succeeded"})
+        batch.write_json(film / "asr" / "chunks.json", [{"chunk_id": "c0000"}])
+        batch.write_json(film / "asr" / "asr-tasks.json", [{"chunk_id": "c0000", "status": "succeeded"}])
+        batch.write_json(film / "asr" / "align-tasks.json", [{
+            "chunk_id": "c0000",
+            "status": "skipped",
+            "reason": "language-unsupported",
+            "skip_policy": batch.UNSUPPORTED_ALIGN_SKIP_POLICY,
+            "alignment_executed": False,
+            "detected_language": "Dutch",
+        }])
+        batch.write_json(film / "asr" / "documents-state.json", {
+            "status": "succeeded", "text_coverage": "gapped", "gap_count": 1,
+        })
+        batch.write_json(film / "asr" / "candidates.json", [])
+        batch.write_json(film / "asr" / "align-language-gaps.json", [{
+            "chunk_id": "c0000",
+            "text": "Ik ah",
+            "start_ticks": 0,
+            "end_ticks": contract.LENGTH_TICKS,
+            "reason": "language-unsupported",
+            "detected_language": "Dutch",
+            "skip_policy": batch.UNSUPPORTED_ALIGN_SKIP_POLICY,
+            "alignment_executed": False,
+            "embed": False,
+            "text_retained": True,
+            "input_text_sha256": "abc",
+        }])
+        batch.publish_transcription(film / "asr", film / "embed")
+        embed_protocol = batch.read_json(film / "embed" / "protocol.json")
+        for entry in embed_protocol["joint_windows"]:
+            write_embedding(film / "embed", "joint", entry, embed_protocol, joint_processing(), unit(0))
+        return film
+
+    def test_unknown_skip_policy_is_refused_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            config["unsupportedAlignLanguagePolicy"] = "force-chinese"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "language-policy")
+            self.assertFalse(output.exists())
+
+    def test_explicit_policy_is_stored_for_a_new_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            config["unsupportedAlignLanguagePolicy"] = batch.UNSUPPORTED_ALIGN_SKIP_POLICY
+            summary = batch.preflight(config)
+            self.assertEqual(summary["unsupportedAlignLanguagePolicy"], batch.UNSUPPORTED_ALIGN_SKIP_POLICY)
+            protocol = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
+            self.assertEqual(protocol["unsupported_align_language_policy"], batch.UNSUPPORTED_ALIGN_SKIP_POLICY)
+            self.assertEqual(protocol["transcription_language_policy"], "auto-v1")
+
+    def test_gapped_film_keeps_audio_visual_and_does_not_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output, 2)
+            batch.preflight(config)
+            film = self.settle_gap(output)
+            assessed = batch.assess_film(film)
+            self.assertEqual(assessed["audioVisualCoverage"], "full")
+            self.assertEqual(assessed["textCoverage"], "gapped")
+            self.assertEqual(assessed["coverage"], "gapped")
+            self.assertNotEqual(assessed["coverage"], "full")
+            self.assertEqual(assessed["nextAction"]["action"], "done")
+            self.assertFalse(assessed["successfulEmpty"])
+            self.assertNotIn("text", assessed["gaps"][0])
+            self.assertEqual(assessed["gaps"][0]["detected_language"], "Dutch")
+            self.assertIs(assessed["gaps"][0]["alignment_executed"], False)
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.load_film_rows(film, batch.signature_for(config))
+            self.assertEqual(caught.exception.reason, "coverage-incomplete")
+            calls = []
+            code, summary = batch.run_batch(
+                config,
+                execute=lambda label, stage: calls.append((label, stage)) or 1,
+                send=lambda label, stage, entry: calls.append(("send", label, stage)),
+            )
+            self.assertEqual(calls, [("F002", "prepare")])
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["stopped"], "F002")
+            self.assertEqual(summary["films"][0]["coverage"], "gapped")
+            self.assertNotIn("Ik ah", json.dumps(summary))
+            limited = []
+            code, summary = batch.run_batch(
+                config, only_labels=["F001"],
+                execute=lambda label, stage: limited.append((label, stage)) or 1,
+                send=lambda label, stage, entry: limited.append(("send", label)),
+            )
+            self.assertEqual(limited, [])
+            self.assertEqual(code, 2)
+            self.assertNotIn("stopped", summary)
+            self.assertEqual(summary["films"][1]["coverage"], "pending")
+            with self.assertRaises(batch.BatchBlocked) as missing:
+                batch.run_batch(config, only_labels=["F999"], execute=lambda *args: None, send=lambda *args: None)
+            self.assertEqual(missing.exception.reason, "config")
+            finish_embeddings(output / "films" / "F002")
+            calls.clear()
+            code, summary = batch.run_batch(
+                config,
+                execute=lambda label, stage: calls.append((label, stage)) or 1,
+                send=lambda label, stage, entry: calls.append(("send", label, stage)),
+            )
+            self.assertEqual(calls, [])
+            self.assertEqual(code, 2)
+            self.assertNotIn("stopped", summary)
+            self.assertEqual(summary["coverage"], "gapped")
+            self.assertEqual(summary["textGapped"], 1)
+            self.assertEqual(summary["full"], 1)
+
+    def test_other_failures_still_stop_when_the_skip_policy_is_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output, 2)
+            config["unsupportedAlignLanguagePolicy"] = batch.UNSUPPORTED_ALIGN_SKIP_POLICY
+            batch.preflight(config)
+            asr = output / "films" / "F001" / "asr"
+            batch.write_json(asr / "prepare.json", {"status": "succeeded"})
+            batch.write_json(asr / "chunks.json", [{"chunk_id": "c0000"}])
+            batch.write_json(asr / "asr-tasks.json", [{"chunk_id": "c0000", "status": "succeeded"}])
+            batch.write_json(asr / "align-tasks.json", [{
+                "chunk_id": "c0000", "status": "failed", "reason": "process",
+            }])
+            calls = []
+            code, summary = batch.run_batch(
+                config, execute=lambda label, stage: calls.append((label, stage)) or 0,
+                send=lambda label, stage, entry: calls.append(("send", label)))
+            self.assertEqual(calls, [])
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertNotEqual(summary["coverage"], "full")
+            self.assertNotEqual(summary["films"][0]["textCoverage"], "full")
+
+
 if __name__ == "__main__":
     unittest.main()

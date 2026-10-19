@@ -10,9 +10,13 @@
 
 语言策略固定为 `auto-v1`：每一小段自己判断语言，不在认不出来时改成中文。不认识、不支持或同一小段里有多种语言时停下。1 毫秒的时间对齐规则不放宽。失败的转写不能当成一份成功的空文本。状态是未知、正在进行或无法确认完成的推理，不会自动再发一次。
 
+默认仍是上面这条严格规则。只有恢复配置显式写了 `unsupportedAlignLanguagePolicy`，而且值正好是 `unsupported-align-language-skip-v1` 时，才多一条窄规则：转写模型认识、对齐模型不支持、原因正好是 `language-unsupported` 的一小段，可以不进文字索引。这一小段保留原文、原文哈希、检测到的语言、原因和策略版本，状态是 `skipped`，`alignment_executed` 为 false。它不是对齐成功，也不是空文本，也不改成中文，也不编造时间。文字候选里没有它。缺语言、同一小段多种语言、不认识的语言、越界、超时、未知和其它错误仍然停下整批。已经失败的旧检查点不会被自动改成跳过。
+
 ## 怎样才算整部片完成
 
 一部片的覆盖记为 full，必须同时满足：准备、转写、对齐、分段、音画和文字都成功，而且窗口从 0 盖到这部片的真实结尾。每扇窗口都是完整的 12 秒，不能截短。摘录或只做完一部分，仍记为未完成。
+
+音画和文字分开记。`audioVisualCoverage` 为 full，表示窗口盖住整条时间线，而且每一扇音画向量都成功。`textCoverage` 为 full，表示没有语言缺口。出现上面那种允许的跳过时，`textCoverage` 为 gapped，整片 `coverage` 不是 full。缺口记录在该片的 `asr/align-language-gaps.json`：片号、块号、起止时间、原因、检测到的语言、策略版本，以及原文还在。进度里的公开缺口不含原文。有缺口就不能把文字说成完整，也不能导入。
 
 默认导入要求清单里的每一部都是 full。少一部就完全不写索引。加上 `--allow-partial` 时，只把已经 full 的写入新索引，命令以非 0 结束，整批覆盖记为 partial，不能把整个目录说成已经完成。
 
@@ -64,6 +68,9 @@
   "processingId": "eg2-7c43611ad2e20661c3d3",
   "maxInflightEmbeddings": 1,
   "transcriptionLanguagePolicy": "auto-v1",
+  "unsupportedAlignLanguagePolicy": "unsupported-align-language-skip-v1",
+  "recoverySource": "$OLD_OUTPUT",
+  "recoverySnapshot": "$V2_SNAPSHOT",
   "expectedFilmCount": 46,
   "template": "$EMPTY_TEMPLATE",
   "references": "$REFERENCE_CACHE",
@@ -73,22 +80,34 @@
 
 `$FROZEN_SOURCES` 是只读的冻结清单。`$EMPTY_TEMPLATE` 是空索引模板，文件名必须以 `.template.db` 结尾。`$NEW_INDEX_DIR` 必须是一个还不存在的新目录。输出目录不能放进样本目录、`asr-` 目录或正在使用的索引目录。
 
+`unsupportedAlignLanguagePolicy` 可以不写。不写时保持严格停下。恢复时才写上面的版本值。`recoverySource` 是旧输出目录，只读。`recoverySnapshot` 是这份旧输出的文件清单，每一项有路径、大小和 sha256。恢复前先核对清单和磁盘一致。新的 `outputRoot` 必须是另一个还不存在的目录。
+
 ## 命令
 
 在仓库工作副本里执行。先准备，确认就绪后再跑；中断后用 resume 从已成功的检查点继续。导入在处理完成之后单独做，并且只写新索引。
 
 ```bash
 PY=/Volumes/Turbo/Library/embedding-service/.venv/bin/python
-$PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py preflight --config "$BATCH_CONFIG"
-$PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$BATCH_CONFIG"
-$PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py status --config "$BATCH_CONFIG"
-$PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py resume --config "$BATCH_CONFIG"
-$PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py import --config "$BATCH_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py preflight --config "$BATCH_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$BATCH_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py status --config "$BATCH_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py resume --config "$BATCH_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py import --config "$BATCH_CONFIG"
 ```
+
+要从旧的失败输出换到一个新目录时，用同一份恢复配置。它包含上面的批次字段，再加旧目录、快照和新的输出目录。准备只复制，不推理。
+
+```bash
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery.py prepare --config "$RECOVERY_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG" --film F006
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
+```
+
+`prepare` 先按快照核对旧目录的每一个文件。核对通过后，把已成功的产物逐个复制到新目录。复制是新的文件字节，不是硬链接，所以后来写入新目录不会改到旧文件。旧目录里的失败检查点、日志和运行身份都不改。只把那一处 `language-unsupported` 失败在新目录里记成跳过，并记下它来自哪一份旧检查点。哈希或身份对不上、还有别的失败、未知状态、孤立输出，都会拒绝，并且不改旧目录。再跑一次 `prepare` 时，新目录的字节如果和回执一致，就不再重写。`--film F006` 只进入这一部；确认它的音画完整、文字留有缺口之后，去掉 `--film` 再跑其余尚未完成的片。`--film` 可以重复。写了不存在的编号会拒绝。它不放宽失败即停。
 
 屏幕上的进度只显示 `F001` 这类编号、覆盖状态和数量，不显示路径、原文、向量或令牌。带路径的清单留在输出目录的私有文件里。
 
-`run` 和 `resume` 的退出码：0 表示全部 full；1 表示准备未就绪，例如模型目录不完整；2 表示普通阶段失败，或还有未完成的片；3 表示停在未知、超时或被打断的推理上。2 和 3 都会停住整批，不会继续下一部，也不会把未完成的结果写成 full。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
+`run` 和 `resume` 的退出码：0 表示每一部都是 full。1 表示准备未就绪，例如模型目录不完整。2 表示普通阶段失败、还有未完成的片，或已完成的片里仍有文字缺口。3 表示停在未知、超时或被打断的推理上。普通失败、未知和超时都会停住整批，不会继续下一部，也不会把未完成的结果写成 full。已经按规则跳过语言、并且音画已经完整的片，不会挡住下一部；这种批次退出 2，进度里有缺口，但没有 `stopped`。只跑 `--film` 时，没被点名的片保持原状态，整批因此也不是 0。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
 
 导入产物是新目录里的 `prepared-index.db`。它保持 `manual_pause=1`、`imported_candidates_only=1` 和 `http://127.0.0.1:18784`。完成的片在索引里是 `complete`。不要打开正在运行的 `index.db`，也不要把 10 秒签名写进去。
 
@@ -97,13 +116,14 @@ $PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py import --config "$BAT
 用上面的绝对解释器，在本工作副本中逐条运行：
 
 ```bash
-$PY plugins/EmbeddingVideoSearch/scripts/full-film-transcribe-test.py
-$PY plugins/EmbeddingVideoSearch/scripts/full-film-embed-test.py
-$PY plugins/EmbeddingVideoSearch/scripts/ten-second-contract-test.py
-$PY plugins/EmbeddingVideoSearch/scripts/sample-c-contract-test.py
-$PY plugins/EmbeddingVideoSearch/scripts/sample-c-import-test.py
-$PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch-test.py
-$PY plugins/EmbeddingVideoSearch/scripts/rebind-full-source-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/full-film-transcribe-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/full-film-embed-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/ten-second-contract-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/sample-c-contract-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/sample-c-import-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/rebind-full-source-test.py
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery-test.py
 git diff --check
 ```
 
