@@ -894,6 +894,136 @@ def execute_command(command, log_path):
     return completed.returncode
 
 
+MODEL_TOKENIZER_FILES = ("vocab.json", "merges.txt")
+MODEL_INDEX_NAMES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+MODEL_WEIGHT_SUFFIXES = {".safetensors", ".bin", ".gguf"}
+PROTOCOL_PATH_FIELDS = (
+    ("asr_model_path", "asrModel"),
+    ("aligner_model_path", "alignerModel"),
+    ("worker_python", "workerPython"),
+)
+
+
+def readable_nonempty(path):
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        with path.open("rb") as handle:
+            return bool(handle.read(1))
+    except OSError:
+        return False
+
+
+def require_weight_index(directory, index_path):
+    try:
+        parsed = json.loads(Path(index_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BatchBlocked("local model weight index is not readable", reason="model-layout") from exc
+    if not isinstance(parsed, dict):
+        raise BatchBlocked("local model weight index is not readable", reason="model-layout")
+    weight_map = parsed.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise BatchBlocked("local model weight index has no shards", reason="model-layout")
+    root = directory.resolve()
+    seen = []
+    for shard in weight_map.values():
+        if not isinstance(shard, str) or shard == "":
+            raise BatchBlocked("local model weight index names an empty shard", reason="model-layout")
+        if shard in seen:
+            continue
+        seen.append(shard)
+        relative = Path(shard)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise BatchBlocked("local model weight index leaves the model directory", reason="model-layout")
+        try:
+            resolved = (directory / relative).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise BatchBlocked("local model weight shard is missing", reason="model-layout") from exc
+        if resolved != root and root not in resolved.parents:
+            raise BatchBlocked("local model weight index leaves the model directory", reason="model-layout")
+        if not readable_nonempty(resolved):
+            raise BatchBlocked("local model weight shard is missing", reason="model-layout")
+    if not seen:
+        raise BatchBlocked("local model weight index has no shards", reason="model-layout")
+
+
+def require_local_model(path):
+    """Require a version directory. Do not search a child, import, or load weights."""
+    directory = Path(path)
+    if not directory.is_dir():
+        raise BatchBlocked("local model directory is missing", reason="model-layout")
+    config_path = directory / "config.json"
+    if not config_path.is_file():
+        raise BatchBlocked("local model is missing config.json", reason="model-layout")
+    try:
+        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BatchBlocked("local model config.json is not a JSON object", reason="model-layout") from exc
+    if not isinstance(parsed, dict) or not parsed:
+        raise BatchBlocked("local model config.json is not a JSON object", reason="model-layout")
+    for name in MODEL_TOKENIZER_FILES:
+        if not readable_nonempty(directory / name):
+            raise BatchBlocked("local model tokenizer file is missing", reason="model-layout")
+    indexes = [directory / name for name in MODEL_INDEX_NAMES if (directory / name).is_file()]
+    if indexes:
+        for index_path in indexes:
+            require_weight_index(directory, index_path)
+        return directory
+    weights = [
+        item for item in directory.iterdir()
+        if item.is_file() and item.suffix.lower() in MODEL_WEIGHT_SUFFIXES and not item.name.endswith(".index.json")
+    ]
+    if not any(readable_nonempty(item) for item in weights):
+        raise BatchBlocked("local model weights are missing", reason="model-layout")
+    return directory
+
+
+def same_configured_path(stored, configured):
+    if not isinstance(stored, str) or stored == "":
+        return False
+    try:
+        return canonical_path(stored) == canonical_path(configured)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def reject_protocol_drift(config):
+    """Refuse a stored model or worker path that is not the configured path. Do not rewrite it."""
+    films = Path(config["outputRoot"]) / "films"
+    if not films.is_dir():
+        return
+    for protocol_path in sorted(films.glob("*/asr/protocol.json")):
+        try:
+            current = read_json(protocol_path)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise BatchBlocked("existing protocol cannot be read", reason="protocol-drift") from exc
+        if not isinstance(current, dict):
+            raise BatchBlocked("existing protocol cannot be read", reason="protocol-drift")
+        for field, key in PROTOCOL_PATH_FIELDS:
+            if not same_configured_path(current.get(field), config[key]):
+                raise BatchBlocked(
+                    "existing protocol does not match config",
+                    reason="protocol-drift",
+                    label=protocol_path.parent.parent.name,
+                )
+
+
+def unknown_stop(assessed=None, exc=None):
+    if exc is not None:
+        return (
+            exc.reason == "not-succeeded"
+            or exc.status in UNKNOWN_STATUSES
+            or exc.reason in {"transcription-unknown", "interrupted-not-retried"}
+        )
+    reason = assessed.get("reason")
+    status = assessed.get("status")
+    return (
+        reason in {"not-succeeded", "transcription-unknown", "interrupted-not-retried"}
+        or status in UNKNOWN_STATUSES
+    )
+
+
 def default_send(film_dir, stage, entry):
     protocol = read_json(Path(film_dir) / "embed" / "protocol.json")
     if int(protocol.get("max_inflight_embeddings", 0)) != MODEL_CONCURRENCY:
@@ -907,11 +1037,13 @@ def preflight(config, *, check_model=False):
     require_config(config)
     output = Path(config["outputRoot"])
     refuse_preserved(output)
-    for key, kind in (("workerPython", "file"), ("asrModel", "dir"), ("alignerModel", "dir"),
-                      ("sourceDirectory", "dir"), ("sourceFacts", "file")):
+    for key, kind in (("workerPython", "file"), ("sourceDirectory", "dir"), ("sourceFacts", "file")):
         path = Path(config[key])
         if kind == "file" and not path.is_file() or kind == "dir" and not path.is_dir():
             raise BatchBlocked("required path is missing", reason="config")
+    require_local_model(config["asrModel"])
+    require_local_model(config["alignerModel"])
+    reject_protocol_drift(config)
     found = match_facts(config["sourceDirectory"], load_facts(config["sourceFacts"]))
     eligible, ineligible = [], []
     for _path, fact in found["matched"]:
@@ -945,6 +1077,7 @@ def preflight(config, *, check_model=False):
         audit = {"films": 0, "reused": 0, "coincidentNotEquivalent": 0, "tailMismatch": 0,
                  "cacheMismatch": 0, "unmatched": 0, "priorUnchanged": True, "forgedInputHash": False}
     if check_model:
+        # Embedding-service signature only. The local ASR files above are not loaded.
         embed.validate_signature(embed.get(contract.ISOLATED_BASE, "/v1/models")["data"][0], signature_for(config), metadata=True)
     summary = {
         "ready": ready,
@@ -1019,24 +1152,29 @@ def run_batch(config, *, execute=None, send=None):
             default_send(output / "films" / label, stage, entry)
     manifest = read_json(output / "manifest.json")
     stopped = None
+    stop_kind = None
     for record in manifest["films"]:
         film_dir = output / "films" / record["label"]
         for _step in range(12):
             assessed = assess_film(film_dir)
             action = assessed["nextAction"]
             if assessed["coverage"] == "full" or action["action"] != "run":
-                if assessed["blocked"] and assessed["reason"] in {"not-succeeded", "transcription-unknown", "interrupted-not-retried"}:
+                if assessed["blocked"]:
                     stopped = record["label"]
+                    stop_kind = "unknown" if unknown_stop(assessed) else "ordinary"
                 break
             stage = action["stage"]
             try:
                 if stage in TRANSCRIBE_STAGES:
                     code = execute(record["label"], stage)
                     assessed = assess_film(film_dir)
-                    if assessed["reason"] in {"transcription-unknown", "interrupted-not-retried"} or assessed["status"] in UNKNOWN_STATUSES:
+                    if unknown_stop(assessed):
                         stopped = record["label"]
+                        stop_kind = "unknown"
                         break
                     if code != 0 or assessed["blocked"] or assessed["nextAction"]["stage"] == stage:
+                        stopped = record["label"]
+                        stop_kind = "ordinary"
                         break
                 elif stage == "publish-transcription":
                     publish_transcription(film_dir / "asr", film_dir / "embed")
@@ -1050,16 +1188,22 @@ def run_batch(config, *, execute=None, send=None):
                         protocol, stage, lambda entry: joint_clip_sha(film_dir / "embed", entry),
                     )
             except BatchBlocked as exc:
-                if exc.reason == "not-succeeded" or exc.status in UNKNOWN_STATUSES or exc.reason in {"transcription-unknown", "interrupted-not-retried"}:
-                    stopped = record["label"]
+                stopped = record["label"]
+                stop_kind = "unknown" if unknown_stop(exc=exc) else "ordinary"
                 break
         if stopped:
+            break
+        if assess_film(film_dir)["coverage"] != "full":
+            stopped = record["label"]
+            stop_kind = "ordinary"
             break
     progress = status_summary(output)
     if stopped:
         progress["stopped"] = stopped
+        if progress.get("coverage") == "full":
+            progress["coverage"] = "pending"
         write_json(output / "progress.json", progress)
-        return 3, progress
+        return (3 if stop_kind == "unknown" else 2), progress
     if progress["full"] != progress["total"]:
         return 2, progress
     return 0, progress

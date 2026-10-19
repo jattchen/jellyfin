@@ -139,12 +139,40 @@ def source_file(directory, name, item, runtime, presence="Readable", label=None,
     return row
 
 
+def write_model_fixture(directory, *, config=True, vocab=True, merges=True, weights=True, index=True,
+                        shard_name="model.safetensors"):
+    """Tiny stand-in for a version directory. These bytes are not model weights."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if config is True:
+        (directory / "config.json").write_text('{"model_type":"fixture"}\n', encoding="utf-8")
+    elif isinstance(config, str):
+        (directory / "config.json").write_text(config, encoding="utf-8")
+    if vocab:
+        (directory / "vocab.json").write_text('{"a":1}\n', encoding="utf-8")
+    if merges:
+        (directory / "merges.txt").write_text("a b\n", encoding="utf-8")
+    if weights:
+        (directory / shard_name).write_bytes(b"fixture-weight")
+    if index:
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"fixture": shard_name}}), encoding="utf-8")
+    return directory
+
+
+def write_parent_model(parent):
+    """A directory that only contains a revision child. The parent has no config.json."""
+    parent = Path(parent)
+    write_model_fixture(parent / "revision")
+    return parent
+
+
 def config_for(root, rows, output):
     media = root / "media"
     worker = root / "worker.py"
     worker.write_text("raise SystemExit(0)\n", encoding="utf-8")
-    (root / "asr-model").mkdir()
-    (root / "align-model").mkdir()
+    write_model_fixture(root / "asr-model")
+    write_model_fixture(root / "align-model")
     facts = write_facts(root / "facts.json", rows)
     return {
         "sourceDirectory": str(media),
@@ -523,6 +551,202 @@ class TranscriptionBoundaries(unittest.TestCase):
             self.assertEqual(code, 3)
             self.assertEqual(summary["stopped"], "F001")
             self.assertEqual(calls, [])
+
+
+class ModelLayoutAndBatchStop(unittest.TestCase):
+    def film_config(self, root, output):
+        row = source_file(root / "media", "film.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+        return config_for(root, [row], output)
+
+    def two_film_config(self, root, output):
+        first = source_file(root / "media", "a.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+        second = source_file(root / "media", "b.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F002")
+        return config_for(root, [first, second], output)
+
+    def assert_refused_before_output(self, config, output, reason):
+        try:
+            batch.preflight(config)
+        except batch.BatchBlocked as exc:
+            self.assertEqual(exc.reason, reason)
+            self.assertFalse(output.exists())
+            return
+        self.fail("preflight accepted the model; output_created=" + str(output.exists()))
+
+    def test_parent_directory_without_model_files_is_refused_before_output(self):
+        for key in ("asrModel", "alignerModel"):
+            with self.subTest(key=key):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    output = root / "output"
+                    config = self.film_config(root, output)
+                    config[key] = str(write_parent_model(root / "parent-model"))
+                    self.assert_refused_before_output(config, output, "model-layout")
+
+    def test_minimal_fixture_preflight_succeeds_without_loading_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            weight = root / "asr-model" / "model.safetensors"
+            before = weight.read_bytes()
+            summary = batch.preflight(config)
+            self.assertTrue(summary["ready"])
+            self.assertEqual(weight.read_bytes(), before)
+            protocol = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
+            self.assertEqual(protocol["asr_model_path"], config["asrModel"])
+            self.assertEqual(protocol["aligner_model_path"], config["alignerModel"])
+
+    def test_missing_weight_tokenizer_or_shard_is_refused(self):
+        defects = (
+            {"vocab": False},
+            {"merges": False},
+            {"weights": False, "index": False},
+            {"weights": False},
+            {"config": "{"},
+            {"config": "[]"},
+            {"config": "{}"},
+        )
+        for defect in defects:
+            with self.subTest(defect=sorted(defect.items())):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    output = root / "output"
+                    config = self.film_config(root, output)
+                    asr = root / "asr-model"
+                    for child in list(asr.iterdir()):
+                        child.unlink()
+                    write_model_fixture(asr, **defect)
+                    self.assert_refused_before_output(config, output, "model-layout")
+
+    def test_index_shard_outside_the_model_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            outside = root / "outside.safetensors"
+            outside.write_bytes(b"outside-weight")
+            (root / "asr-model" / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"fixture": "../outside.safetensors"}}), encoding="utf-8")
+            self.assert_refused_before_output(config, output, "model-layout")
+            self.assertEqual(outside.read_bytes(), b"outside-weight")
+
+    def test_existing_protocol_path_or_worker_drift_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            batch.preflight(config)
+            protocol = output / "films" / "F001" / "asr" / "protocol.json"
+            original = protocol.read_bytes()
+            other_worker = root / "other-worker.py"
+            other_worker.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            replacements = {
+                "asrModel": str(write_model_fixture(root / "other-asr")),
+                "alignerModel": str(write_model_fixture(root / "other-align")),
+                "workerPython": str(other_worker),
+            }
+            for key, value in replacements.items():
+                with self.subTest(key=key):
+                    drifted = dict(config)
+                    drifted[key] = value
+                    try:
+                        batch.preflight(drifted)
+                    except batch.BatchBlocked as exc:
+                        self.assertEqual(exc.reason, "protocol-drift")
+                        self.assertEqual(protocol.read_bytes(), original)
+                        continue
+                    self.fail(key + " drift was ignored; protocol_unchanged=" + str(protocol.read_bytes() == original))
+
+    def test_equivalent_canonical_path_keeps_the_stored_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            batch.preflight(config)
+            protocol = output / "films" / "F001" / "asr" / "protocol.json"
+            original = protocol.read_bytes()
+            linked_worker = root / "worker-link.py"
+            linked_worker.symlink_to(Path(config["workerPython"]))
+            config["asrModel"] = str(Path(config["asrModel"]) / ".")
+            config["alignerModel"] = str(Path(config["alignerModel"]) / ".")
+            config["workerPython"] = str(linked_worker)
+            summary = batch.preflight(config)
+            self.assertTrue(summary["ready"])
+            self.assertEqual(protocol.read_bytes(), original)
+            stored = batch.read_json(protocol)
+            self.assertFalse(stored["asr_model_path"].endswith("/."))
+            self.assertNotEqual(stored["worker_python"], str(linked_worker))
+
+    def test_ordinary_stage_nonzero_does_not_enter_the_next_film(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.two_film_config(root, output)
+            calls = []
+
+            def execute(label, stage):
+                calls.append((label, stage))
+                return 1
+
+            code, summary = batch.run_batch(
+                config, execute=execute, send=lambda label, stage, entry: calls.append(("send", label)))
+            self.assertEqual(calls, [("F001", "prepare")])
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertNotEqual(summary["coverage"], "full")
+            self.assertNotEqual(summary["films"][0]["coverage"], "full")
+
+    def test_failed_checkpoint_stops_before_the_next_film(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.two_film_config(root, output)
+            batch.preflight(config)
+            asr = output / "films" / "F001" / "asr"
+            batch.write_json(asr / "prepare.json", {"status": "succeeded"})
+            batch.write_json(asr / "chunks.json", [{"chunk_id": "c0000"}])
+            batch.write_json(asr / "asr-tasks.json", [{"chunk_id": "c0000", "status": "failed"}])
+            before = asr.joinpath("asr-tasks.json").read_bytes()
+            calls = []
+            code, summary = batch.run_batch(
+                config, execute=lambda label, stage: calls.append((label, stage)) or 0,
+                send=lambda label, stage, entry: calls.append(("send", label)))
+            self.assertEqual(calls, [])
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertNotEqual(summary["coverage"], "full")
+            self.assertEqual(asr.joinpath("asr-tasks.json").read_bytes(), before)
+
+    def test_timeout_stops_before_the_next_film(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.two_film_config(root, output)
+            calls = []
+
+            def execute(label, stage):
+                calls.append((label, stage))
+                asr = output / "films" / label / "asr"
+                if stage == "prepare":
+                    batch.write_json(asr / "prepare.json", {"status": "succeeded"})
+                    batch.write_json(asr / "chunks.json", [{"chunk_id": "c0000"}])
+                    return 0
+                if stage == "asr":
+                    batch.write_json(asr / "asr-tasks.json", [{
+                        "chunk_id": "c0000", "status": "unknown", "reason": "timeout",
+                    }])
+                    return 1
+                return 1
+
+            code, summary = batch.run_batch(
+                config, execute=execute, send=lambda label, stage, entry: calls.append(("send", label)))
+            self.assertEqual(calls, [("F001", "prepare"), ("F001", "asr")])
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertNotEqual(summary["coverage"], "full")
+            task = batch.read_json(output / "films" / "F001" / "asr" / "asr-tasks.json")
+            self.assertEqual(task[0]["status"], "unknown")
+            self.assertEqual(task[0]["reason"], "timeout")
 
 
 class PrepareAndImport(unittest.TestCase):

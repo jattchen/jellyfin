@@ -57,7 +57,7 @@ ASR/对齐与两路embedding不要同时推理。单片脚本合成检查分别�
 
 120 秒样本的原文件、缓存和失败记录保持不动。准备阶段只写审计，不复制样本响应。时钟重合的窗口仍要比较来源、签名、绝对时间和输入哈希；哈希不同记为未等价，尾窗不在整片格子上另记。`presence` 按清单原值保留，不参加这组身份比较。
 
-源事实用冻结清单。验收和这条命令使用绝对解释器 `/Volumes/Turbo/Library/embedding-service/.venv/bin/python`，不要用系统自带的 python3。私有配置放在 Git 外面。导入写入新的 `prepared-index.db`，不打开正在运行的 `index.db`，也不混入 10 秒索引。
+源事实用冻结清单。验收和这条命令使用绝对解释器 `/Volumes/Turbo/Library/embedding-service/.venv/bin/python`，不要用系统自带的 python3。转写模型要填版本目录本身，不能填只有版本子目录的上一层。`--check-model` 只核对 18784 的向量服务。新的一次使用新输出目录，旧的失败协议和检查点留在原地。私有配置放在 Git 外面。导入写入新的 `prepared-index.db`，不打开正在运行的 `index.db`，也不混入 10 秒索引。
 
 这次只对应 issue 3。连续结果和相似结果不在这里。
 
