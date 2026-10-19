@@ -82,7 +82,7 @@ $PY plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py import --config "$BAT
 
 屏幕上的进度只显示 `F001` 这类编号、覆盖状态和数量，不显示路径、原文、向量或令牌。带路径的清单留在输出目录的私有文件里。
 
-`run` 和 `resume` 的退出码：0 表示全部 full；1 表示准备未就绪；2 表示还有未完成的片；3 表示停在未知或被打断的推理上，后面的片不会继续发请求。
+`run` 和 `resume` 的退出码：0 表示全部 full；1 表示准备未就绪；2 表示还有未完成的片；3 表示停在未知或被打断的推理上，后面的片不会继续发请求。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
 
 导入产物是新目录里的 `prepared-index.db`。它保持 `manual_pause=1`、`imported_candidates_only=1` 和 `http://127.0.0.1:18784`。完成的片在索引里是 `complete`。不要打开正在运行的 `index.db`，也不要把 10 秒签名写进去。
 

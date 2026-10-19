@@ -886,7 +886,7 @@ def transcribe_command(config, run, stage):
 
 def execute_command(command, log_path):
     log_path = Path(log_path)
-    log_path.parent.mkdir(parents=True, mode=0o700)
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     completed = subprocess.run(command, check=False, capture_output=True)
     with log_path.open("ab") as handle:
         handle.write(completed.stdout)

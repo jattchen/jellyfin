@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import sqlite3
+import sys
 import unittest
 import uuid
 from pathlib import Path
@@ -415,6 +416,20 @@ class WindowAndReuse(unittest.TestCase):
                 contract.clip_window(
                     run, dict(entry, full_film=True), source, contract.window_template(), probe,
                     embed.sha, embed.save, embed.read, lambda _source: facts)
+
+
+class CommandLogs(unittest.TestCase):
+    def test_two_consecutive_stages_reuse_the_log_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory) / "films" / "F001" / "logs"
+            codes = []
+            for stage in ("prepare", "asr"):
+                command = [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", stage]
+                codes.append(batch.execute_command(command, logs / (stage + ".log")))
+            self.assertEqual(codes, [0, 0])
+            self.assertEqual((logs / "prepare.log").read_text(encoding="utf-8"), "prepare")
+            self.assertEqual((logs / "asr.log").read_text(encoding="utf-8"), "asr")
+            self.assertTrue(logs.is_dir())
 
 
 class TranscriptionBoundaries(unittest.TestCase):
