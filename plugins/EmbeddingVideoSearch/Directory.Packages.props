@@ -1,0 +1,6 @@
+<Project>
+  <!-- Nearest Directory.Packages.props wins. Versions stay on each PackageReference. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

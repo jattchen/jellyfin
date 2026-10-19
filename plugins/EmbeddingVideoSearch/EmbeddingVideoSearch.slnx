@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Jellyfin.Plugin.EmbeddingVideoSearch/Jellyfin.Plugin.EmbeddingVideoSearch.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Jellyfin.Plugin.EmbeddingVideoSearch.Tests/Jellyfin.Plugin.EmbeddingVideoSearch.Tests.csproj" />
+  </Folder>
+</Solution>

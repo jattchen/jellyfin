@@ -1,0 +1,15 @@
+bin/
+obj/
+artifacts/
+TestResults/
+*.user
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.dylib
+tmp/
+*.mp4
+*.mkv
+*.webm
+*.wav
