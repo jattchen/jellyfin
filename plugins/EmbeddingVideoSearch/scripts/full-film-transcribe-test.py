@@ -133,6 +133,107 @@ def align_record(chunk, text, units):
     }
 
 
+class AutoLanguageTests(unittest.TestCase):
+    def auto_layout(self, run, count=1):
+        chunks = write_layout(run, [5 * driver.SAMPLE_RATE] * count,
+                              runtime=count * 5 * driver.TICKS_PER_SECOND)
+        body = driver.load_protocol(run)
+        body["transcription_language_policy"] = "auto-v1"
+        save_protocol(run, body)
+        return chunks
+
+    def fake_asr(self, language, text):
+        record = asr_record(text)
+        record.update(language_forced=None, language_detected=language,
+                      transcription_language_policy="auto-v1", language_granularity="chunk")
+        record["raw_result"]["language"] = language
+        return record
+
+    def test_detected_languages_reach_alignment_and_original_text_survives_documents(self):
+        fixtures = [("English", "Hello world.", ["Hello", "world"]),
+                    ("Russian", "Привет мир.", ["Привет", "мир"]),
+                    ("Japanese", "こんにちは。", list("こんにちは")),
+                    ("Chinese", "你好。", list("你好"))]
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            chunks = self.auto_layout(run, len(fixtures))
+            calls = []
+            def launch(kind, chunk, output, body):
+                index = int(chunk["chunk_id"][1:])
+                language, text, words = fixtures[index]
+                command = driver.worker_command(body, kind, chunk, output,
+                    driver.output_path(run, "asr", chunk["chunk_id"]))
+                self.assertEqual(command[-2:], ["--language-policy", "auto-v1"])
+                if kind == "asr":
+                    record = self.fake_asr(language, text)
+                else:
+                    asr = driver.load_json(driver.output_path(run, "asr", chunk["chunk_id"]))
+                    self.assertEqual(driver.align_route(asr, "auto-v1"), (language, None))
+                    record = align_record(chunk, text, [
+                        {"text": word, "start_time": .1 + i * .2, "end_time": .2 + i * .2}
+                        for i, word in enumerate(words)])
+                    record.update(language=language, transcription_language_policy="auto-v1",
+                                  language_granularity="chunk")
+                driver.save_json(output, record)
+                calls.append((kind, language))
+                return {"returncode": 0, "elapsed_seconds": .1, "stderr": ""}
+            driver.stage_asr(run, launch=launch)
+            driver.stage_align(run, launch=launch)
+            rows = driver.stage_documents(run)
+            self.assertEqual("".join(row["text"] for row in rows), "".join(f[1] for f in fixtures))
+            self.assertEqual({row["provenance"]["detected_language"] for row in rows}, {f[0] for f in fixtures})
+            self.assertIsNone(driver.asr_language_argument("auto-v1"))
+            driver.stage_asr(run, launch=launch)
+            driver.stage_align(run, launch=launch)
+            self.assertEqual(len(calls), 8)
+
+    def test_successful_empty_auto_asr_skips_alignment_without_chinese_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            self.auto_layout(run)
+            def launch(kind, chunk, output, body):
+                self.assertEqual(kind, "asr")
+                driver.save_json(output, self.fake_asr("", ""))
+                return {"returncode": 0, "elapsed_seconds": .1, "stderr": ""}
+            driver.stage_asr(run, launch=launch)
+            driver.stage_align(run, launch=launch)
+            record = driver.load_json(driver.output_path(run, "align", "c0000"))
+            self.assertEqual(record["language"], "")
+            self.assertFalse(record["alignment_executed"])
+            self.assertEqual(driver.stage_documents(run), [])
+
+    def test_unknown_or_unsupported_substantive_language_blocks_before_alignment(self):
+        for language in ("", "unknown", "Arabic", "invented-language"):
+            with self.subTest(language=language), tempfile.TemporaryDirectory() as directory:
+                run = Path(directory)
+                self.auto_layout(run)
+                def launch(kind, chunk, output, body):
+                    self.assertEqual(kind, "asr", "unsupported language reached model alignment")
+                    driver.save_json(output, self.fake_asr(language, "some speech"))
+                    return {"returncode": 0, "elapsed_seconds": .1, "stderr": ""}
+                driver.stage_asr(run, launch=launch)
+                with self.assertRaises(driver.StageBlocked):
+                    driver.stage_align(run, launch=launch)
+                self.assertEqual(driver.load_tasks(run, "align")[0]["status"], "failed")
+                self.assertFalse(driver.output_path(run, "align", "c0000").exists())
+
+    def test_chinese_checkpoint_cannot_be_relabelled_as_auto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            write_layout(run, [5 * driver.SAMPLE_RATE])
+            def launch(kind, chunk, output, body):
+                driver.save_json(output, asr_record("你好。"))
+                return {"returncode": 0, "elapsed_seconds": .1, "stderr": ""}
+            driver.stage_asr(run, launch=launch)
+            before = (run / "asr-tasks.json").read_bytes()
+            body = driver.load_protocol(run)
+            body["transcription_language_policy"] = "auto-v1"
+            save_protocol(run, body)
+            with self.assertRaises(driver.StageBlocked):
+                driver.stage_asr(run, launch=lambda *a: self.fail("old checkpoint was dispatched again"))
+            self.assertEqual((run / "asr-tasks.json").read_bytes(), before)
+
+
 class DriverTests(unittest.TestCase):
     def test_approved_tail_view_keeps_raw_and_enforces_the_narrow_boundary(self):
         duration = 22.19625
