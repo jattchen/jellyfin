@@ -604,6 +604,11 @@ def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe
     return arguments, facts
 
 
+def entry_full_film(entry):
+    """Excerpt rows stay false. A whole-film row must say so itself."""
+    return bool(isinstance(entry, dict) and entry.get("full_film") is True)
+
+
 def clip_window(run, entry, source, window, probe, sha, save, read, source_facts):
     checked_window(window)
     facts = check_source_probe(probe, source["audioStreamIndex"])
@@ -620,7 +625,7 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
         "video_start_time_raw": facts["video_start_time_raw"],
         "attached_picture_stream_indexes": facts["attached_picture_stream_indexes"],
         "item_id": canonical_item(source["itemId"]), "content_version": source["contentVersion"],
-        "source_path": source["sourcePath"], "full_film": False,
+        "source_path": source["sourcePath"], "full_film": entry_full_film(entry),
     }
     if state_path.exists():
         state = read(state_path)
