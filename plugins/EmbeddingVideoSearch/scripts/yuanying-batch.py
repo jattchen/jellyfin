@@ -181,6 +181,7 @@ def copy_source(source):
 
 
 def source_tuple(source):
+    """Identity is the file, media and version fields. presence is only an observation."""
     values = []
     for field in SOURCE_FIELDS:
         if field not in source:
@@ -197,8 +198,6 @@ def source_tuple(source):
         values.append((field, value))
     if values[0][1] != dict(values)["sourceItemId"]:
         raise BatchBlocked("itemId and sourceItemId differ", reason="source-mismatch")
-    if "presence" in source:
-        values.append(("presence", source["presence"]))
     return tuple(values)
 
 
@@ -501,7 +500,6 @@ def reuse_decision(film_protocol, film_entry, prior_protocol, prior_entry, prior
     if film_hash != prior_hash:
         record["reason"] = "input-hash-not-equivalent"
         return record
-    record["reused"] = True
     record["reason"] = "equivalent-checkpoint"
     return record
 
@@ -538,8 +536,12 @@ def audit_prior_windows(film_protocol, prior_protocol, prior_states, clip_shas):
 
 
 def adopt_equivalent(decision, prior_response, dest_run, film_entry):
-    """Copy a response only when the two input hashes are already equal."""
-    if not decision.get("reused") or not decision.get("inputHashEquivalent"):
+    """Copy a response only when a caller asks and the two hashes already match.
+
+    preflight, run, resume, status and import do not call this. Audit records
+    the decision and leaves reused false.
+    """
+    if decision.get("reason") != "equivalent-checkpoint" or not decision.get("inputHashEquivalent"):
         return None
     if decision.get("forgedInputHash"):
         raise BatchBlocked("refusing to forge an input hash", reason="forged-input-hash")
@@ -590,7 +592,10 @@ def read_prior_run(run):
 
 
 def audit_sample_root(output_root, sample_root):
-    """Read sample embed runs and write an audit under the new output only."""
+    """Read sample embed runs and write an audit under the new output only.
+
+    This does not copy responses. reused stays zero on this path.
+    """
     sample_root = Path(sample_root)
     before = snapshot_tree(sample_root)
     output_root = Path(output_root)

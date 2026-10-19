@@ -223,13 +223,17 @@ class WindowAndReuse(unittest.TestCase):
             for label, (start, end) in spans.items():
                 item = str(uuid.uuid4())
                 source = source_file(root, label + ".mp4", item, runtimes[label])["source"]
-                sample_windows = contract.window_entries(source, start, end)
+                self.assertEqual(source["presence"], "Readable")
+                prior_source = {key: source[key] for key in batch.SOURCE_FIELDS}
+                self.assertNotIn("presence", prior_source)
+                self.assertTrue(batch.same_source(source, prior_source))
+                sample_windows = contract.window_entries(prior_source, start, end)
                 film_windows = batch.window_entries(source)
                 planned = {(entry["start_ticks"], entry["end_ticks"]) for entry in film_windows}
                 film_by_span = {(entry["start_ticks"], entry["end_ticks"]): entry for entry in film_windows}
                 prior = {
                     "signature": SIGNATURE, "window": contract.window_template(),
-                    "source": source, "joint_windows": sample_windows,
+                    "source": prior_source, "joint_windows": sample_windows,
                 }
                 film = {
                     "signature": SIGNATURE, "window": contract.window_template(),
@@ -311,6 +315,8 @@ class WindowAndReuse(unittest.TestCase):
             decision = batch.reuse_decision(
                 protocol, entry, protocol, entry, {"status": "succeeded", "input_hash": digest}, "clip")
             self.assertEqual(decision["reason"], "equivalent-checkpoint")
+            self.assertTrue(decision["inputHashEquivalent"])
+            self.assertFalse(decision["reused"])
             prior = root / "sample"
             prior.mkdir()
             response_path = prior / "old.json"
@@ -321,6 +327,59 @@ class WindowAndReuse(unittest.TestCase):
             self.assertFalse(state["forgedInputHash"])
             self.assertEqual(batch.snapshot_tree(prior), before)
             self.assertEqual((root / "new-run" / "joint" / (entry["candidate_id"] + ".json")).read_bytes(), b"same-response")
+
+    def test_audit_keeps_presence_out_of_identity_and_does_not_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = 1_392_853_330
+            filmed = source_file(root / "media", "film.mp4", str(uuid.uuid4()), runtime, label="F001")
+            source = filmed["source"]
+            prior_source = {key: source[key] for key in batch.SOURCE_FIELDS}
+            output = root / "output"
+            config = config_for(root, [filmed], output)
+            batch.preflight(config)
+            protocol = batch.read_json(output / "films" / "F001" / "embed" / "protocol.json")
+            self.assertEqual(protocol["source"]["presence"], "Readable")
+            sample = root / "sample-embed" / "embed-C1"
+            (sample / "joint").mkdir(parents=True)
+            (sample / "clips").mkdir()
+            sample_windows = contract.window_entries(prior_source, 100_000_000, 1_300_000_000)
+            prior = {
+                "signature": SIGNATURE, "window": contract.window_template(),
+                "source": prior_source, "joint_windows": sample_windows,
+            }
+            batch.write_json(sample / "protocol.json", prior)
+            for entry in sample_windows:
+                digest, _window = embed.embedding_input(prior, "joint", entry, "clip")
+                batch.write_json(sample / "joint" / (entry["candidate_id"] + ".state.json"), {
+                    "status": "succeeded", "input_hash": digest,
+                })
+                batch.write_json(sample / "clips" / (entry["candidate_id"] + ".clip.json"), {"sha256": "clip"})
+            before = batch.snapshot_tree(root / "sample-embed")
+            summary = batch.audit_sample_root(output, root / "sample-embed")
+            self.assertEqual(summary["coincidentNotEquivalent"], 11)
+            self.assertEqual(summary["tailMismatch"], 1)
+            self.assertEqual(summary["reused"], 0)
+            self.assertTrue(summary["priorUnchanged"])
+            self.assertEqual(batch.snapshot_tree(root / "sample-embed"), before)
+            self.assertFalse((output / "films" / "F001" / "embed" / "joint").exists())
+            audit = batch.read_json(output / "films" / "F001" / "sample-reuse-audit.json")
+            reasons = {}
+            for record in audit["records"]:
+                reasons[record["reason"]] = reasons.get(record["reason"], 0) + 1
+                self.assertFalse(record["reused"])
+            self.assertEqual(reasons, {"input-hash-not-equivalent": 11, "tail-boundary-mismatch": 1})
+            drifted = dict(prior_source, contentVersion="changed")
+            decision = batch.reuse_decision(
+                protocol, protocol["joint_windows"][1], {"source": drifted, "signature": SIGNATURE},
+                sample_windows[0], {"status": "succeeded", "input_hash": "x"}, "clip")
+            self.assertEqual(decision["reason"], "source-mismatch")
+            other_signature = dict(SIGNATURE, processing_id="eg2-ffffffffffffffff")
+            decision = batch.reuse_decision(
+                protocol, protocol["joint_windows"][1],
+                {"source": prior_source, "signature": other_signature},
+                sample_windows[0], {"status": "succeeded", "input_hash": "x"}, "clip")
+            self.assertEqual(decision["reason"], "signature-mismatch")
 
     def test_sample_clip_identity_stays_false_until_the_row_says_full(self):
         with tempfile.TemporaryDirectory() as directory:
