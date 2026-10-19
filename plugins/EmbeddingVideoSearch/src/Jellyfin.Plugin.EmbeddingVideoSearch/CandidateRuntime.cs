@@ -29,9 +29,11 @@ public sealed partial class SearchRuntime
         ranked.RemoveAll(hit => !allowedIds.Contains(hit.SegmentId));
         ApplyStoredCoverage(ranked);
         response.QualityPolicy = CandidateQuality(candidates);
-        response.Results = request.GroupByVideo
+        var selected = request.GroupByVideo
             ? CandidateRanking.TakeByVideo(ranked, limit, ApiV1.GroupedHitsPerVideo)
             : ranked.Take(limit).ToList();
+        // Collapse only this already returned page. The lower-ranked tail must not extend a run.
+        response.Results = request.CollapseRuns ? RunCollapse.Apply(selected, fresh) : selected;
         response.RawResults = request.Diagnostics ? ranked : null;
         response.IndexComplete = _store.Coverage(selection.Libraries).IndexComplete;
         response.Availability = Availability(ranked.Count == 0 ? "empty" : "available", selection.Libraries.Count == 0 ? "noLibraries" : "none");

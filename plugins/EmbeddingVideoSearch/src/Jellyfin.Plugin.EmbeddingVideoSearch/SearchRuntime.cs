@@ -307,6 +307,7 @@ public sealed partial class SearchRuntime : IDisposable
                 Score = score,
                 Quality = score >= _store.RelatedMinimum ? "related" : "weak",
                 IndexComplete = row.MediaState == "complete",
+                ContentVersion = row.ContentVersion,
                 BindingVersion = SegmentBinding.Version(row.SegmentId, row.ItemId, row.MediaSourceId, row.ContentVersion, row.StartTicks, row.EndTicks, "jointAudioVideo")
             };
             if (hit.Quality == "related")
@@ -323,6 +324,11 @@ public sealed partial class SearchRuntime : IDisposable
         weak.Sort(static (left, right) => right.Score.CompareTo(left.Score));
         response.Results.AddRange(related.Take(limit));
         response.Results.AddRange(weak.Take(limit));
+        if (request.CollapseRuns)
+        {
+            response.Results = RunCollapse.Apply(response.Results, null);
+        }
+
         if (_store.ActiveGeneration != snapshot.Generation)
         {
             response.Results.Clear();
@@ -697,6 +703,7 @@ public sealed partial class SearchRuntime : IDisposable
             QualityPolicy = Quality()
         };
         WindowContract.Apply(response.Compatibility, response.Window, active?.WindowVersion);
+        response.Features = [ApiV1.GroupedVideoFeature, ApiV1.CollapsedRunsFeature];
         return response;
     }
 
