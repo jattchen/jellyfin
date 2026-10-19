@@ -74,9 +74,11 @@ def connect_index(path, execute):
     """Open the index. Dry-run never uses read-write: that would create WAL sidecars.
 
     A stopped backup can still have SQLite write-version 2 and no -wal/-shm. Plain
-    mode=ro then fails on the first SELECT. immutable=1 reads that file without
-    creating sidecars, but only after no process holds it and any WAL is absent or empty.
-    A non-empty WAL is refused so its frames are not silently ignored.
+    mode=ro is not a portable read of that file: some builds reject the first SELECT,
+    and others answer it while creating -wal and -shm. immutable=1 reads the
+    checkpointed file without creating sidecars, but only after no process holds it
+    and any WAL is absent or empty. A non-empty WAL is refused so its frames are not
+    silently ignored.
     """
     resolved = path.resolve()
     if execute:

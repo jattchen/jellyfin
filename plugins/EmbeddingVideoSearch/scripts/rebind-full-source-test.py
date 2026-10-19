@@ -184,6 +184,14 @@ def main():
 
 
 def leave_wal_header_without_sidecars(path):
+    """Leave a checkpointed WAL-header database and prove the dry-run boundary.
+
+    Byte 18 stays 2 and both sidecars start absent. Plain mode=ro is only observed:
+    an "unable to open database file" error is the older outcome, and a successful
+    read is the newer one. Any other error still fails. Sidecars created by that
+    probe are removed before the product open. connect_index must then read the
+    pause setting, leave the database bytes unchanged, and create no sidecars.
+    """
     connection = sqlite3.connect(path)
     assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
     connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -193,16 +201,31 @@ def leave_wal_header_without_sidecars(path):
         sidecar = pathlib.Path(str(path) + suffix)
         if sidecar.exists():
             sidecar.unlink()
-    assert path.read_bytes()[18] == 2
+    snapshot = path.read_bytes()
+    assert snapshot[18] == 2
     assert not pathlib.Path(str(path) + "-wal").exists()
+    assert not pathlib.Path(str(path) + "-shm").exists()
     plain = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
     try:
-        plain.execute("SELECT COUNT(*) FROM settings").fetchone()
-        raise AssertionError("mode=ro unexpectedly queried a WAL-header database with no sidecars")
-    except sqlite3.OperationalError as error:
-        assert "unable to open database file" in str(error)
+        try:
+            row = plain.execute("SELECT value FROM settings WHERE key='manual_pause'").fetchone()
+        except sqlite3.OperationalError as error:
+            assert "unable to open database file" in str(error)
+        else:
+            assert row == ("1",)
     finally:
         plain.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = pathlib.Path(str(path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    assert path.read_bytes() == snapshot
+    opened = rebind.connect_index(path, execute=False)
+    try:
+        assert opened.execute("SELECT value FROM settings WHERE key='manual_pause'").fetchone() == ("1",)
+    finally:
+        opened.close()
+    assert path.read_bytes() == snapshot
     assert not pathlib.Path(str(path) + "-wal").exists()
     assert not pathlib.Path(str(path) + "-shm").exists()
 
