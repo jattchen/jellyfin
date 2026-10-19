@@ -24,6 +24,9 @@ public sealed class CandidateRepresentation
     public double[] Background { get; set; } = [];
     public CandidateRow[] Candidates { get; set; } = [];
 
+    /// <summary>Set only when a sample transcription succeeded and produced no embeddable lines.</summary>
+    public bool TranscriptionChecked { get; set; }
+
     public bool Matches(StoredSignature signature) => Model == signature.Model && Revision == signature.Revision
         && ProcessingId == signature.ProcessingId && Dimension == signature.Dimension && Normalized == signature.Normalized
         && (Channel != "joint" || InputVersion == signature.InputVersion);
@@ -36,8 +39,23 @@ public sealed class CandidateRepresentation
             || (Channel == "joint" && (InputVersion != ApiV1.InputVersion || EmbeddingTask != "video_audio"))
             || (Channel == "text" && (InputVersion != "transcript-document-cache-v1" || EmbeddingTask != "document"))
             || string.IsNullOrWhiteSpace(SegmentationVersion) || string.IsNullOrWhiteSpace(ReferenceVersion)
-            || string.IsNullOrWhiteSpace(ReferenceQueryVersion) || Algorithm != CandidateRanking.Version
-            || !double.IsFinite(Scale) || Scale <= 0 || Background.Length == 0
+            || string.IsNullOrWhiteSpace(ReferenceQueryVersion) || Algorithm != CandidateRanking.Version)
+        {
+            throw new InvalidDataException("Invalid candidate representation or reference curve.");
+        }
+
+        // A checked excerpt can contain no dialogue. Joint rows still carry the reference curve.
+        if (Channel == "text" && TranscriptionChecked && Candidates.Length == 0)
+        {
+            if (Background.Length != 0 || Scale != 0)
+            {
+                throw new InvalidDataException("A checked empty transcription has no reference curve.");
+            }
+
+            return;
+        }
+
+        if (!double.IsFinite(Scale) || Scale <= 0 || Background.Length == 0
             || Background.Any(v => !double.IsFinite(v)) || Candidates.Length == 0)
         {
             throw new InvalidDataException("Invalid candidate representation or reference curve.");

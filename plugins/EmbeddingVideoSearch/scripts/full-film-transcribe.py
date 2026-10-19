@@ -5,6 +5,9 @@ Stages are separate and serial. Model work runs one chunk per subprocess.
 Successful checkpoints are reused. Failed, unknown and truncated chunks stop
 the stage and are not retried. This script does not embed, import, download,
 or start a service.
+
+Omit transcription_language_policy to keep forced Chinese. Set it to auto-v1
+to detect one language per audio chunk. Empty successful text skips alignment.
 """
 
 from __future__ import annotations
@@ -56,6 +59,37 @@ CHUNK_FIELDS = (
 TIMESTAMP_TOLERANCE_SECONDS = 0.001
 TAIL_TIME_POLICY = "last-unit-tail-80ms-v1"
 ALIGNER_REVISION = "53c8c0e46733eec430e4b53dd6471d0e5dee45f8"
+AUTO_LANGUAGE_POLICY = "auto-v1"
+# Allowlists copied from the installed model config support_languages.
+# ASR 30: qwen3-asr-1.7b e1f6c266914abc5a46e8756e02580f834a6cf8a7
+# Aligner 11: qwen3-forced-aligner-0.6b 53c8c0e46733eec430e4b53dd6471d0e5dee45f8
+# Codes follow that aligner file plus mlx_qwen3_asr forced_aligner.tokenize_text.
+ASR_LANGUAGE_NAMES = (
+    "Chinese", "English", "Cantonese", "Arabic", "German", "French", "Spanish",
+    "Portuguese", "Indonesian", "Italian", "Korean", "Russian", "Thai", "Vietnamese",
+    "Japanese", "Turkish", "Hindi", "Malay", "Dutch", "Swedish", "Danish", "Finnish",
+    "Polish", "Czech", "Filipino", "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
+)
+ALIGNER_LANGUAGE_CODES = {
+    "Chinese": "zh",
+    "English": "en",
+    "Cantonese": "yue",
+    "French": "fr",
+    "German": "de",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Portuguese": "pt",
+    "Russian": "ru",
+    "Spanish": "es",
+}
+MISSING_DETECTED_LANGUAGE = frozenset({"", "unknown", "none"})
+# Space-delimited aligner languages. Chinese and Cantonese stay character-shaped,
+# and Japanese/Korean use their own tokenizers. English and Russian also gain '.'.
+SPACE_WORD_LANGUAGES = frozenset({
+    "English", "Russian", "French", "German", "Spanish", "Italian", "Portuguese",
+})
+SENTENCE_PERIOD_LANGUAGES = frozenset({"English", "Russian"})
 
 
 class StageBlocked(RuntimeError):
@@ -115,6 +149,138 @@ def align_clean(text):
 
 def substantive(text):
     return any(character.isalnum() for character in text)
+
+
+def _alias_map(names):
+    return {name.casefold(): name for name in names}
+
+
+ASR_LANGUAGE_ALIASES = _alias_map(ASR_LANGUAGE_NAMES)
+ALIGNER_LANGUAGE_ALIASES = _alias_map(ALIGNER_LANGUAGE_CODES)
+for _name, _code in ALIGNER_LANGUAGE_CODES.items():
+    ALIGNER_LANGUAGE_ALIASES[_code] = _name
+ALIGNER_LANGUAGE_ALIASES["jp"] = "Japanese"
+ALIGNER_LANGUAGE_ALIASES["kr"] = "Korean"
+
+
+def language_policy(protocol):
+    value = protocol.get("transcription_language_policy", None)
+    if value is None:
+        return None
+    if value == AUTO_LANGUAGE_POLICY:
+        return value
+    raise StageBlocked(f"未知转写语言策略：{value}")
+
+
+def asr_language_argument(policy):
+    """Language passed to Qwen transcribe. None asks the model to detect."""
+    if policy is None:
+        return "Chinese"
+    if policy == AUTO_LANGUAGE_POLICY:
+        return None
+    raise StageBlocked(f"未知转写语言策略：{policy}")
+
+
+def aligner_language_name(detected):
+    if not isinstance(detected, str):
+        return None
+    key = detected.strip().casefold().replace("_", "-")
+    if key in MISSING_DETECTED_LANGUAGE:
+        return None
+    return ALIGNER_LANGUAGE_ALIASES.get(key)
+
+
+def is_cjk_char(character):
+    code = ord(character)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x20000 <= code <= 0x2A6DF
+        or 0x2A700 <= code <= 0x2B73F
+        or 0x2B740 <= code <= 0x2B81F
+        or 0x2B820 <= code <= 0x2CEAF
+        or 0xF900 <= code <= 0xFAFF
+    )
+
+
+def split_segment_with_cjk(segment):
+    tokens = []
+    buf = []
+
+    def flush():
+        if buf:
+            tokens.append("".join(buf))
+            buf.clear()
+
+    for character in segment:
+        if is_cjk_char(character):
+            flush()
+            tokens.append(character)
+        else:
+            buf.append(character)
+    flush()
+    return tokens
+
+
+def space_word_tokens(text):
+    """Word tokens the aligner keeps for space-delimited text, spaces excluded."""
+    tokens = []
+    for segment in str(text).split():
+        cleaned = align_clean(segment)
+        if cleaned:
+            tokens.extend(split_segment_with_cjk(cleaned))
+    return tokens
+
+
+def units_match_words(units, text, language):
+    if language not in SPACE_WORD_LANGUAGES:
+        return True
+    actual = [unit.get("text", "") for unit in units]
+    return actual == space_word_tokens(text)
+
+
+def primary_delimiters_for(language):
+    if language in SENTENCE_PERIOD_LANGUAGES:
+        return PRIMARY_DELIMITERS + "."
+    return PRIMARY_DELIMITERS
+
+
+def detected_language_conflict(record):
+    """True when one audio chunk's own ASR pieces name more than one language."""
+    raw = record.get("raw_result") or {}
+    found = []
+    for item in raw.get("chunks") or []:
+        if not isinstance(item, dict) or not substantive(item.get("text") or ""):
+            continue
+        label = str(item.get("language") or "").strip()
+        if label.casefold() not in MISSING_DETECTED_LANGUAGE:
+            found.append(label.casefold())
+    return len(set(found)) > 1
+
+
+def align_route(record, policy):
+    """Return (aligner language or skip label, block reason)."""
+    text = ((record or {}).get("raw_result") or {}).get("text")
+    if policy != AUTO_LANGUAGE_POLICY:
+        return "Chinese", None
+    detected = record.get("language_detected") if isinstance(record, dict) else None
+    if not isinstance(detected, str):
+        if substantive(text or ""):
+            return None, "language-missing"
+        return "", None
+    if substantive(text or "") and detected_language_conflict(record):
+        return None, "language-mixed-chunk"
+    if not substantive(text or ""):
+        return detected, None
+    folded = detected.strip().casefold().replace("_", "-")
+    if folded in MISSING_DETECTED_LANGUAGE:
+        return None, "language-missing"
+    name = aligner_language_name(detected)
+    if name is None:
+        if folded in ASR_LANGUAGE_ALIASES:
+            return None, "language-unsupported"
+        return None, "language-unknown"
+    return name, None
 
 
 def parse_peak_rss(stderr):
@@ -605,12 +771,15 @@ def output_path(run, stage, chunk_id):
 
 
 def worker_command(protocol, kind, chunk, output, asr_json=None):
+    policy = language_policy(protocol)
     if kind == "asr":
         model = protocol["asr_model_path"]
         extra = ["--max-new-tokens", str(ASR_MAX_NEW_TOKENS)]
     else:
         model = protocol["aligner_model_path"]
         extra = ["--asr-json", str(asr_json)]
+    if policy == AUTO_LANGUAGE_POLICY:
+        extra.extend(["--language-policy", AUTO_LANGUAGE_POLICY])
     return [
         "/usr/bin/time",
         "-l",
@@ -677,8 +846,8 @@ def launch_real(kind, chunk, output, protocol):
     }
 
 
-def asr_identity(protocol, chunk):
-    return {
+def asr_identity(protocol, chunk, detected_language=None):
+    identity = {
         "wav_sha256": chunk["wav_sha256"],
         "model_path": str(protocol["asr_model_path"]),
         "max_new_tokens": ASR_MAX_NEW_TOKENS,
@@ -687,10 +856,16 @@ def asr_identity(protocol, chunk):
         "dtype": "bfloat16",
         "draft_model": None,
     }
+    if language_policy(protocol) != AUTO_LANGUAGE_POLICY:
+        return identity
+    identity["language"] = None
+    identity["transcription_language_policy"] = AUTO_LANGUAGE_POLICY
+    identity["detected_language"] = detected_language
+    return identity
 
 
-def align_identity(protocol, chunk, asr_sha):
-    return {
+def align_identity(protocol, chunk, asr_sha, asr_record=None):
+    identity = {
         "wav_sha256": chunk["wav_sha256"],
         "asr_raw_sha256": asr_sha,
         "model_path": str(protocol["aligner_model_path"]),
@@ -698,15 +873,38 @@ def align_identity(protocol, chunk, asr_sha):
         "dtype": "bfloat16",
         "draft_model": None,
     }
+    policy = language_policy(protocol)
+    if policy != AUTO_LANGUAGE_POLICY:
+        return identity
+    detected = ""
+    if isinstance(asr_record, dict) and isinstance(asr_record.get("language_detected"), str):
+        detected = asr_record["language_detected"]
+    routed, _blocked = align_route(asr_record or {}, policy)
+    identity["language"] = routed if routed is not None else detected
+    identity["transcription_language_policy"] = AUTO_LANGUAGE_POLICY
+    identity["detected_language"] = detected
+    return identity
 
 
-def parse_asr_record(record):
+def parse_asr_record(record, policy=None):
     raw = record.get("raw_result") or {}
     text = raw.get("text")
     truncated = bool(raw.get("truncated")) or raw.get("finish_reason") == "length"
     problems = []
-    if record.get("language_forced") != "Chinese":
-        problems.append("language")
+    if policy == AUTO_LANGUAGE_POLICY:
+        if record.get("transcription_language_policy") != AUTO_LANGUAGE_POLICY:
+            problems.append("language_policy")
+        if "language_forced" not in record or record.get("language_forced") is not None:
+            problems.append("language_forced")
+        if not isinstance(record.get("language_detected"), str):
+            problems.append("language_detected")
+        if record.get("language_granularity") != "chunk":
+            problems.append("language_granularity")
+    else:
+        if record.get("language_forced") != "Chinese":
+            problems.append("language")
+        if record.get("transcription_language_policy") not in (None, ""):
+            problems.append("language_policy")
     if record.get("context") != "":
         problems.append("context")
     if record.get("max_new_tokens") != ASR_MAX_NEW_TOKENS:
@@ -722,13 +920,18 @@ def parse_asr_record(record):
     return text, truncated, problems
 
 
-def parse_align_record(record, expected_text, sample_count, duration):
+def parse_align_record(record, expected_text, sample_count, duration, expected_language="Chinese", policy=None):
     problems = []
     units = record.get("units")
     if record.get("input_text") != expected_text:
         problems.append("input_text")
-    if record.get("language") != "Chinese" or record.get("dtype") != "bfloat16":
+    if record.get("language") != expected_language or record.get("dtype") != "bfloat16":
         problems.append("language_or_dtype")
+    if policy is None:
+        if record.get("transcription_language_policy") not in (None, ""):
+            problems.append("language_policy")
+    elif record.get("transcription_language_policy") != AUTO_LANGUAGE_POLICY or record.get("language_granularity") != "chunk":
+        problems.append("language_policy")
     if record.get("alignment_executed") is not True or record.get("asr_inference_executed") is not False:
         problems.append("execution_flags")
     if record.get("audio_samples") != sample_count or record.get("audio_rate") != SAMPLE_RATE:
@@ -742,7 +945,9 @@ def parse_align_record(record, expected_text, sample_count, duration):
     slots = capture.get("raw_slot_predictions_ms")
     if not isinstance(slots, list) or len(slots) != 2 * len(units):
         problems.append("parser_capture")
-    if align_clean("".join(unit.get("text", "") for unit in units)) != align_clean(expected_text):
+    if not units_match_words(units, expected_text, expected_language):
+        problems.append("text_coverage")
+    elif align_clean("".join(unit.get("text", "") for unit in units)) != align_clean(expected_text):
         problems.append("text_coverage")
     overflow = out_of_bounds_units(units, duration)
     if overflow:
@@ -784,14 +989,14 @@ def out_of_bounds_units(units, duration):
     return found
 
 
-def alignment_view(record, protocol, text, sample_count, duration):
+def alignment_view(record, protocol, text, sample_count, duration, expected_language="Chinese"):
     """Derive bounded search times; never edit the model response or its words."""
     policy = protocol.get("alignment_time_policy")
     if policy is None:
         return record, None
     if policy != TAIL_TIME_POLICY:
         raise StageBlocked("未知对齐时间派生规则")
-    problems = parse_align_record(record, text, sample_count, duration)
+    problems = parse_align_record(record, text, sample_count, duration, expected_language, language_policy(protocol))
     if problems != ["last-unit-out-of-bounds"]:
         return record, None
     units = record["units"]
@@ -807,7 +1012,7 @@ def alignment_view(record, protocol, text, sample_count, duration):
         raise StageBlocked("尾点派生只适用于已确认的固定对齐模型")
     derived = copy.deepcopy(record)
     derived["units"][-1]["end_time"] = duration
-    if parse_align_record(derived, text, sample_count, duration):
+    if parse_align_record(derived, text, sample_count, duration, expected_language, language_policy(protocol)):
         raise StageBlocked("尾点派生后仍未通过原1ms时间范围及原文校验")
     receipt = {
         "version": TAIL_TIME_POLICY,
@@ -867,10 +1072,14 @@ def stage_revalidate_tail(run):
             chunk = chunks[task["chunk_id"]]
             text, asr_sha = asr_text_for_chunk(run, chunk)
             path = output_path(run, "align", chunk["chunk_id"])
-            record = reuse_succeeded(task, align_identity(protocol, chunk, asr_sha), path)
+            asr_record = load_json(output_path(run, "asr", chunk["chunk_id"]))
+            routed_language, route_error = align_route(asr_record, language_policy(protocol))
+            if route_error:
+                raise StageBlocked("原ASR语言无法对齐，不能复核尾点")
+            record = reuse_succeeded(task, align_identity(protocol, chunk, asr_sha, asr_record), path)
             view, receipt = alignment_view(record, protocol, text,
-                int(chunk["end_sample"]) - int(chunk["start_sample"]), float(chunk["duration_seconds"]))
-            if receipt is None or parse_align_record(view, text, record["audio_samples"], float(chunk["duration_seconds"])):
+                int(chunk["end_sample"]) - int(chunk["start_sample"]), float(chunk["duration_seconds"]), routed_language)
+            if receipt is None or parse_align_record(view, text, record["audio_samples"], float(chunk["duration_seconds"]), routed_language, language_policy(protocol)):
                 raise StageBlocked("原失败不满足有限尾点派生条件，未重新推理")
             task.update(status="succeeded", reason="derived-tail-boundary-validated",
                         original_validation_failure=source_task, time_boundary_derivation=receipt,
@@ -924,6 +1133,7 @@ def stage_asr(run, launch=None):
     lock = acquire_lock(run)
     try:
         protocol = load_protocol(run)
+        policy = language_policy(protocol)
         require_asr_budget(protocol)
         if launch is launch_real:
             if not Path(protocol.get("asr_model_path", "")).is_dir():
@@ -938,8 +1148,10 @@ def stage_asr(run, launch=None):
             destination = output_path(run, "asr", chunk["chunk_id"])
             prior = find_task(tasks, chunk["chunk_id"])
             if prior is not None:
+                record = load_json(destination) if destination.is_file() else {}
+                identity = asr_identity(protocol, chunk, record.get("language_detected"))
                 reuse_succeeded(prior, identity, destination)
-                text, truncated, problems = parse_asr_record(load_json(destination))
+                text, truncated, problems = parse_asr_record(record, policy)
                 if truncated or problems or text is None:
                     raise StageBlocked(f"{chunk['chunk_id']} 的成功 ASR 记录无法复核，未重新推理")
                 print(f"asr {chunk['chunk_id']} reuse", flush=True)
@@ -964,7 +1176,7 @@ def stage_asr(run, launch=None):
                 raise StageBlocked(f"{chunk['chunk_id']} ASR 没有输出，完成状态未知，未自动重试")
             try:
                 record = load_json(destination)
-                text, truncated, problems = parse_asr_record(record)
+                text, truncated, problems = parse_asr_record(record, policy)
                 peak = record.get("mlx_peak_allocated_bytes")
             except Exception as exc:
                 finish_model_task(run, "asr", tasks, task, "unknown", "unreadable-output", outcome, None, destination)
@@ -977,6 +1189,7 @@ def stage_asr(run, launch=None):
                 status = "unknown" if outcome["returncode"] != 0 else "failed"
                 finish_model_task(run, "asr", tasks, task, status, reason, outcome, peak, destination)
                 raise StageBlocked(f"{chunk['chunk_id']} ASR {status}（{reason}），未自动重试")
+            task["identity"] = asr_identity(protocol, chunk, record.get("language_detected"))
             task["text_sha256"] = text_sha256(text)
             finish_model_task(
                 run,
@@ -999,19 +1212,19 @@ def asr_text_for_chunk(run, chunk):
     path = output_path(run, "asr", chunk["chunk_id"])
     if not path.is_file():
         raise StageBlocked(f"{chunk['chunk_id']} 缺少 ASR 输出")
-    text, truncated, problems = parse_asr_record(load_json(path))
+    text, truncated, problems = parse_asr_record(load_json(path), language_policy(load_protocol(run)))
     if truncated or problems or text is None:
         raise StageBlocked(f"{chunk['chunk_id']} 的 ASR 不是可对齐的完整结果")
     return text, file_sha256(path)
 
 
-def write_skip_alignment(path, asr_sha, text, reason, sample_count):
+def write_skip_alignment(path, asr_sha, text, reason, sample_count, language="Chinese", policy=None):
     save_json(
         path,
         {
             "asr_raw_sha256": asr_sha,
             "input_text": text,
-            "language": "Chinese",
+            "language": language,
             "dtype": "bfloat16",
             "backend": None,
             "audio_samples": sample_count,
@@ -1021,6 +1234,7 @@ def write_skip_alignment(path, asr_sha, text, reason, sample_count):
             "alignment_executed": False,
             "asr_inference_executed": False,
             "skip_reason": reason,
+            **({"transcription_language_policy": policy, "language_granularity": "chunk"} if policy else {}),
             "mlx_peak_allocated_bytes": None,
         },
     )
@@ -1033,6 +1247,7 @@ def stage_align(run, launch=None):
     lock = acquire_lock(run)
     try:
         protocol = load_protocol(run)
+        policy = language_policy(protocol)
         if launch is launch_real:
             if not Path(protocol.get("aligner_model_path", "")).is_dir():
                 raise StageBlocked("aligner_model_path 不存在")
@@ -1047,7 +1262,9 @@ def stage_align(run, launch=None):
         reject_if_blocked(tasks)
         for chunk in chunks:
             text, asr_sha = asr_text_for_chunk(run, chunk)
-            identity = align_identity(protocol, chunk, asr_sha)
+            asr_record = load_json(output_path(run, "asr", chunk["chunk_id"]))
+            routed_language, route_error = align_route(asr_record, policy)
+            identity = align_identity(protocol, chunk, asr_sha, asr_record)
             destination = output_path(run, "align", chunk["chunk_id"])
             prior = find_task(tasks, chunk["chunk_id"])
             sample_count = int(chunk["end_sample"]) - int(chunk["start_sample"])
@@ -1055,11 +1272,16 @@ def stage_align(run, launch=None):
                 reuse_succeeded(prior, identity, destination)
                 print(f"align {chunk['chunk_id']} reuse", flush=True)
                 continue
+            if route_error:
+                tasks.append({"chunk_id": chunk["chunk_id"], "status": "failed", "identity": identity,
+                              "reason": route_error, "detected_language": asr_record.get("language_detected")})
+                record_task(run, "align", tasks)
+                raise StageBlocked(f"{chunk['chunk_id']} 对齐语言不可用（{route_error}），未回退中文")
             if destination.exists():
                 raise StageBlocked(f"{chunk['chunk_id']} 存在无检查点的对齐输出，未自动重跑")
             if not substantive(text):
                 reason = "empty" if text == "" else "non_substantive"
-                write_skip_alignment(destination, asr_sha, text, reason, sample_count)
+                write_skip_alignment(destination, asr_sha, text, reason, sample_count, routed_language, policy)
                 task = {
                     "chunk_id": chunk["chunk_id"],
                     "status": "succeeded",
@@ -1107,8 +1329,8 @@ def stage_align(run, launch=None):
                 raise StageBlocked(f"{chunk['chunk_id']} 对齐没有输出，完成状态未知，未自动重试")
             try:
                 record = load_json(destination)
-                view, receipt = alignment_view(record, protocol, text, sample_count, float(chunk["duration_seconds"]))
-                problems = parse_align_record(view, text, sample_count, float(chunk["duration_seconds"]))
+                view, receipt = alignment_view(record, protocol, text, sample_count, float(chunk["duration_seconds"]), routed_language)
+                problems = parse_align_record(view, text, sample_count, float(chunk["duration_seconds"]), routed_language, policy)
                 if receipt is not None:
                     task["time_boundary_derivation"] = receipt
                 peak = record.get("mlx_peak_allocated_bytes")
@@ -1232,9 +1454,11 @@ def documents_for_chunk(chunk, protocol, asr_text, align_record, asr_sha, align_
         return []
     if align_record.get("alignment_executed") is not True:
         raise StageBlocked(f"{chunk['chunk_id']} 有实质文本但没有对齐")
+    policy = language_policy(protocol)
+    detected = align_record.get("language", "Chinese")
     view, boundary = alignment_view(
         align_record, protocol, asr_text,
-        int(chunk["end_sample"]) - int(chunk["start_sample"]), float(chunk["duration_seconds"]),
+        int(chunk["end_sample"]) - int(chunk["start_sample"]), float(chunk["duration_seconds"]), detected,
     )
     units = view["units"]
     overflow = out_of_bounds_units(units, float(chunk["duration_seconds"]))
@@ -1271,7 +1495,7 @@ def documents_for_chunk(chunk, protocol, asr_text, align_record, asr_sha, align_
         return chosen, units[chosen[0]]["start_time"], units[chosen[-1]]["end_time"]
 
     atoms = []
-    for start, end in split_positions(asr_text, 0, len(asr_text), PRIMARY_DELIMITERS):
+    for start, end in split_positions(asr_text, 0, len(asr_text), primary_delimiters_for(detected) if policy else PRIMARY_DELIMITERS):
         _ids, content_start, content_end = info(start, end)
         if content_end - content_start > CONTENT_LIMIT_SECONDS:
             atoms.extend(split_positions(asr_text, start, end, OVERLONG_DELIMITERS))
@@ -1313,6 +1537,10 @@ def documents_for_chunk(chunk, protocol, asr_text, align_record, asr_sha, align_
             [index for index in ids if units[index]["start_time"] == units[index]["end_time"]],
             number,
         )
+        if policy:
+            provenance["transcription_language_policy"] = policy
+            provenance["detected_language"] = detected
+            provenance["language_granularity"] = "chunk"
         if protocol.get("alignment_time_policy"):
             provenance["alignment_time_policy"] = protocol["alignment_time_policy"]
         if boundary is not None and boundary["unit_index"] in ids:
@@ -1377,6 +1605,8 @@ def documents_identity(run, protocol, chunks):
         str(protocol["source"]["runtimeTicks"]),
         str(protocol["source"]["contentVersion"]),
     ]
+    if language_policy(protocol):
+        parts.append(language_policy(protocol))
     if protocol.get("alignment_time_policy"):
         parts.append(protocol["alignment_time_policy"])
     for chunk in chunks:
@@ -1478,7 +1708,7 @@ def stage_documents(run):
         release_lock(lock)
 
 
-def worker_asr(model, wav, output, max_new_tokens):
+def worker_asr(model, wav, output, max_new_tokens, policy=None):
     import importlib.metadata
 
     import mlx.core as mx
@@ -1497,7 +1727,7 @@ def worker_asr(model, wav, output, max_new_tokens):
         wav,
         model=loaded,
         dtype=mx.bfloat16,
-        language="Chinese",
+        language=asr_language_argument(policy),
         context="",
         max_new_tokens=ASR_MAX_NEW_TOKENS,
         return_timestamps=False,
@@ -1509,7 +1739,7 @@ def worker_asr(model, wav, output, max_new_tokens):
     mx.synchronize()
     record = {
         "raw_result": dataclasses.asdict(result),
-        "language_forced": "Chinese",
+        "language_forced": asr_language_argument(policy),
         "context": "",
         "max_new_tokens": ASR_MAX_NEW_TOKENS,
         "dtype": "bfloat16",
@@ -1523,12 +1753,15 @@ def worker_asr(model, wav, output, max_new_tokens):
         "mlx_version": importlib.metadata.version("mlx"),
         "alignment_executed": False,
     }
+    if policy:
+        record.update(transcription_language_policy=policy, language_detected=result.language or "",
+                      language_granularity="chunk")
     save_json(Path(output), record)
     if result.truncated or result.finish_reason == "length":
         raise SystemExit(3)
 
 
-def worker_align(model, wav, asr_json, output):
+def worker_align(model, wav, asr_json, output, policy=None):
     import importlib.metadata
 
     import mlx.core as mx
@@ -1540,7 +1773,10 @@ def worker_align(model, wav, asr_json, output):
     asr_path = Path(asr_json)
     asr_bytes = asr_path.read_bytes()
     asr = json.loads(asr_bytes)
-    text = asr["raw_result"]["text"]
+    text, truncated, problems = parse_asr_record(asr, policy)
+    routed_language, route_error = align_route(asr, policy)
+    if truncated or problems or route_error:
+        raise StageBlocked("对齐输入语言或ASR记录无效，未回退中文")
     captures = []
     original = ForcedAlignTextProcessor.parse_timestamp_ms.__func__
 
@@ -1560,7 +1796,7 @@ def worker_align(model, wav, asr_json, output):
     mx.reset_peak_memory()
     started = time.monotonic()
     aligner = ForcedAligner(model, dtype=mx.bfloat16, backend="mlx")
-    units = aligner.align(audio, text, "Chinese")
+    units = aligner.align(audio, text, routed_language)
     mx.synchronize()
     if len(captures) != 1:
         raise SystemExit("对齐解析次数异常")
@@ -1568,7 +1804,7 @@ def worker_align(model, wav, asr_json, output):
     record = {
         "asr_raw_sha256": hashlib.sha256(asr_bytes).hexdigest(),
         "input_text": text,
-        "language": "Chinese",
+        "language": routed_language,
         "dtype": "bfloat16",
         "backend": "mlx",
         "model_path": model,
@@ -1587,6 +1823,9 @@ def worker_align(model, wav, asr_json, output):
         "alignment_executed": True,
         "asr_inference_executed": False,
     }
+    if policy:
+        record.update(transcription_language_policy=policy, language_granularity="chunk",
+                      detected_language=asr.get("language_detected"))
     save_json(Path(output), record)
 
 
@@ -1600,6 +1839,7 @@ def parse_args(argv):
     parser.add_argument("--output", help=argparse.SUPPRESS)
     parser.add_argument("--asr-json", help=argparse.SUPPRESS)
     parser.add_argument("--max-new-tokens", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--language-policy", choices=(AUTO_LANGUAGE_POLICY,), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.worker:
         if not args.model or not args.wav or not args.output:
@@ -1618,9 +1858,9 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         if args.worker == "asr":
-            worker_asr(args.model, args.wav, args.output, args.max_new_tokens)
+            worker_asr(args.model, args.wav, args.output, args.max_new_tokens, args.language_policy)
         elif args.worker == "align":
-            worker_align(args.model, args.wav, args.asr_json, args.output)
+            worker_align(args.model, args.wav, args.asr_json, args.output, args.language_policy)
         elif args.stage == "prepare":
             stage_prepare(args.run)
         elif args.stage == "asr":

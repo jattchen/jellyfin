@@ -19,7 +19,9 @@ import urllib.request
 # The frozen pilot endpoint is local. macOS system proxies need not bypass loopback.
 LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 TEN_SECOND_VERSION = "10s-8s-5f70-tail-v1"
+TWELVE_SECOND_VERSION = "12s-10s-4f70-tail-v1"
 _CONTRACT = None
+_SAMPLE = None
 
 
 def contract_module():
@@ -33,14 +35,31 @@ def contract_module():
     return _CONTRACT
 
 
+def sample_module():
+    global _SAMPLE
+    if _SAMPLE is None:
+        path = Path(__file__).with_name("sample-c-contract.py")
+        spec = importlib.util.spec_from_file_location("sample_c_contract", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SAMPLE = module
+    return _SAMPLE
+
+
+def profile_module(version):
+    if version == TEN_SECOND_VERSION:
+        return contract_module()
+    if version == TWELVE_SECOND_VERSION:
+        return sample_module()
+    raise AssertionError("Unsupported window version: " + str(version))
+
+
 def active_ten_second(protocol):
     window = (protocol or {}).get("window") or {}
     version = window.get("version")
     if version in (None, "", "6s-4s-tail-v1"):
         return None
-    if version != TEN_SECOND_VERSION:
-        raise AssertionError("Unsupported window version: " + str(version))
-    return contract_module().checked_window(window)
+    return profile_module(version).checked_window(window)
 
 
 def read(path):
@@ -117,7 +136,7 @@ def validate_response(response, signature, kind, window=None):
     processing = item['processing']
     if kind == 'joint':
         if window is not None:
-            contract_module().validate_joint_processing(processing)
+            profile_module(window.get("version")).validate_joint_processing(processing)
         else:
             assert set(processing['modalities']) == {'video', 'audio'}
             assert processing['video']['audio_included'] is True
@@ -231,7 +250,7 @@ def _publish_shared_document(directory, input_hash, response_path, signature, wi
 
 def clip(run, entry, source, window=None, probe=None):
     if window is not None:
-        return contract_module().clip_window(run, entry, source, window, probe, sha, save, read, source_facts)
+        return profile_module(window.get("version")).clip_window(run, entry, source, window, probe, sha, save, read, source_facts)
     path = run / 'clips' / (entry['candidate_id'] + '.mp4')
     state_path = path.with_suffix('.clip.json')
     identity = {'source': source_facts(source), 'start_ticks': entry['start_ticks'],
@@ -399,8 +418,9 @@ def main():
     os.umask(0o077)
     run = args.run.resolve()
     protocol = read(run / 'protocol.json')
-    if active_ten_second(protocol) is not None:
-        contract_module().run_embedding(sys.modules[__name__], args, run, protocol)
+    profile = active_ten_second(protocol)
+    if profile is not None:
+        profile_module(profile["version"]).run_embedding(sys.modules[__name__], args, run, protocol)
         return
     assert protocol['max_inflight_embeddings'] == 1
     entries = protocol['joint_windows'] if args.stage == 'joint' else read(run / 'candidates.json')

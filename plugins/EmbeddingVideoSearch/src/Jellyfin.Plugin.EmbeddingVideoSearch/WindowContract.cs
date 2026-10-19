@@ -2,17 +2,28 @@ namespace Jellyfin.Plugin.EmbeddingVideoSearch;
 
 /// <summary>
 /// The accepted 6-second contract stays on <see cref="ApiV1.WindowVersion"/>.
-/// The 10-second profile is a second index version for a new host. It does not replace the 6-second planner.
+/// The 10-second and 12-second profiles are separate index versions. They do not replace the 6-second planner.
 /// </summary>
 public static class WindowContract
 {
     public static readonly int[] TenSecondSamples = [0, 2, 4, 6, 8];
+    public static readonly int[] TwelveSecondSamples = [0, 3, 6, 9];
 
     public static bool IsAcceptedIndexVersion(string? version)
-        => version == ApiV1.WindowVersion || version == ApiV1.TenSecondWindowVersion;
+        => version == ApiV1.WindowVersion
+           || version == ApiV1.TenSecondWindowVersion
+           || version == ApiV1.TwelveSecondWindowVersion;
 
     public static void Apply(CompatibilityBody compatibility, WindowContractBody window, string? storedVersion)
     {
+        if (storedVersion == ApiV1.TwelveSecondWindowVersion)
+        {
+            compatibility.WindowVersion = ApiV1.TwelveSecondWindowVersion;
+            window.LengthTicks = ApiV1.TwelveSecondWindowTicks;
+            window.StepTicks = ApiV1.TwelveSecondStepTicks;
+            return;
+        }
+
         if (storedVersion == ApiV1.TenSecondWindowVersion)
         {
             compatibility.WindowVersion = ApiV1.TenSecondWindowVersion;
@@ -69,6 +80,47 @@ public static class WindowContract
             || processing.OffsetSeconds is null
             || !processing.OffsetSeconds.SequenceEqual(TenSecondSamples)
             || processing.WindowSeconds != 10
+            || processing.SampleRate != 16000
+            || processing.Channels != 1
+            || processing.AudioTruncated != false
+            || processing.AudioCoverage != "full_track")
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    public static bool TwelveSecondClipDurationAccepted(double seconds)
+    {
+        if (double.IsNaN(seconds) || double.IsInfinity(seconds))
+        {
+            return false;
+        }
+
+        var delta = Math.Abs(Milliseconds(seconds) - 12_000);
+        return delta <= 150 && TwelveSecondSamples.All(offset => Milliseconds(seconds) > offset * 1000);
+    }
+
+    public static bool TwelveSecondJoint(WindowProcessing processing)
+    {
+        if (processing.FpsDeclared
+            || processing.AudioIncluded != true
+            || processing.HasAudio != true
+            || processing.VideoDurationSeconds is not double video
+            || processing.AudioDurationSeconds is not double audio
+            || !TwelveSecondClipDurationAccepted(video)
+            || !AudioCoversClip(audio, video)
+            || processing.SampledSeconds is null
+            || !processing.SampledSeconds.SequenceEqual(TwelveSecondSamples)
+            || processing.FrameCount != 4
+            || processing.MaxSoftTokens != 70
+            || processing.AddTimestamps != false
+            || processing.Profile != ApiV1.TwelveSecondProfile
+            || processing.OverflowStrategy != "reject"
+            || processing.OffsetSeconds is null
+            || !processing.OffsetSeconds.SequenceEqual(TwelveSecondSamples)
+            || processing.WindowSeconds != 12
             || processing.SampleRate != 16000
             || processing.Channels != 1
             || processing.AudioTruncated != false
