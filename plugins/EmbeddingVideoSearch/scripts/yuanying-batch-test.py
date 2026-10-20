@@ -1140,6 +1140,64 @@ class LanguageGapAndSelection(unittest.TestCase):
             self.assertNotEqual(summary["coverage"], "full")
             self.assertNotEqual(summary["films"][0]["textCoverage"], "full")
 
+    def test_explicit_tail_policy_is_stored_for_a_new_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            config["alignmentTimePolicy"] = batch.ALIGNMENT_TIME_POLICY
+            summary = batch.preflight(config)
+            self.assertEqual(summary["alignmentTimePolicy"], batch.ALIGNMENT_TIME_POLICY)
+            self.assertEqual(batch.ALIGNMENT_TIME_POLICY, "last-unit-tail-80ms-v1")
+            manifest = batch.read_json(output / "manifest.json")
+            self.assertEqual(manifest["alignmentTimePolicy"], batch.ALIGNMENT_TIME_POLICY)
+            protocol = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
+            self.assertEqual(protocol["alignment_time_policy"], batch.ALIGNMENT_TIME_POLICY)
+            self.assertEqual(protocol["transcription_language_policy"], "auto-v1")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            config["alignmentTimePolicy"] = "widen-1ms"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "language-policy")
+            self.assertFalse(output.exists())
+
+    def test_unknown_failure_still_stops_before_the_next_film_when_tail_policy_is_on(self):
+        cases = (
+            ("unknown", "timeout", 3),
+            ("failed", "process", 2),
+        )
+        for status, reason, expected in cases:
+            with self.subTest(status=status, reason=reason):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    output = root / "output"
+                    config = self.film_config(root, output, 2)
+                    config["unsupportedAlignLanguagePolicy"] = batch.UNSUPPORTED_ALIGN_SKIP_POLICY
+                    config["alignmentTimePolicy"] = batch.ALIGNMENT_TIME_POLICY
+                    batch.preflight(config)
+                    asr = output / "films" / "F001" / "asr"
+                    protocol = batch.read_json(asr / "protocol.json")
+                    self.assertEqual(protocol["alignment_time_policy"], batch.ALIGNMENT_TIME_POLICY)
+                    batch.write_json(asr / "prepare.json", {"status": "succeeded"})
+                    batch.write_json(asr / "chunks.json", [{"chunk_id": "c0000"}])
+                    batch.write_json(asr / "asr-tasks.json", [{"chunk_id": "c0000", "status": "succeeded"}])
+                    batch.write_json(asr / "align-tasks.json", [{
+                        "chunk_id": "c0000", "status": status, "reason": reason,
+                    }])
+                    calls = []
+                    code, summary = batch.run_batch(
+                        config,
+                        execute=lambda label, stage: calls.append((label, stage)) or 0,
+                        send=lambda label, stage, entry: calls.append(("send", label)),
+                    )
+                    self.assertEqual(calls, [])
+                    self.assertEqual(code, expected)
+                    self.assertEqual(summary["stopped"], "F001")
+                    self.assertNotEqual(summary["films"][1]["coverage"], "full")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -484,6 +484,138 @@ class DriverTests(unittest.TestCase):
             self.assertIn("time_boundary_derivation", rows[-1]["provenance"])
             self.assertLessEqual(rows[-1]["end_ticks"], 120000000)
 
+    def test_twenty_nine_millisecond_tail_is_refused_until_the_explicit_policy(self):
+        count = 462896
+        duration = count / driver.SAMPLE_RATE
+        text = "甲乙"
+        units = [
+            {"text": "甲", "start_time": 0.1, "end_time": 1.0},
+            {"text": "乙", "start_time": 25.52, "end_time": 28.96},
+        ]
+        chunk = {"start_sample": 0, "end_sample": count, "duration_seconds": duration}
+        raw = align_record(chunk, text, units)
+        model = "/models/" + driver.ALIGNER_REVISION
+        raw["model_path"] = model
+        before = json.dumps(raw, sort_keys=True)
+        plain = protocol()
+        plain["aligner_model_path"] = model
+        approved = dict(plain)
+        approved["alignment_time_policy"] = driver.TAIL_TIME_POLICY
+        self.assertEqual(driver.parse_align_record(raw, text, count, duration), ["last-unit-out-of-bounds"])
+        self.assertIsNone(driver.alignment_view(raw, plain, text, count, duration)[1])
+        self.assertEqual(json.dumps(raw, sort_keys=True), before)
+        view, receipt = driver.alignment_view(raw, approved, text, count, duration)
+        self.assertEqual(json.dumps(raw, sort_keys=True), before)
+        self.assertEqual(driver.parse_align_record(view, text, count, duration), [])
+        self.assertEqual(view["units"][-1]["end_time"], duration)
+        self.assertEqual(raw["units"][-1]["end_time"], 28.96)
+        self.assertEqual(receipt["end_retracted_ticks"], 290000)
+        self.assertEqual(int(round((28.96 - duration) * driver.TICKS_PER_SECOND)), 290000)
+        self.assertFalse(receipt["transcription_accuracy_verified"])
+        wide = json.loads(before)
+        wide["units"][-1]["end_time"] = duration + 0.081
+        self.assertIsNone(driver.alignment_view(wide, approved, text, count, duration)[1])
+        non_last = json.loads(before)
+        non_last["units"][0]["end_time"] = duration + 0.02
+        non_last["units"][1]["start_time"] = duration + 0.03
+        non_last["units"][1]["end_time"] = duration + 0.05
+        self.assertTrue(any(not item["is_last"] for item in driver.out_of_bounds_units(non_last["units"], duration)))
+        self.assertIsNone(driver.alignment_view(non_last, approved, text, count, duration)[1])
+
+        def run_align(policy, check, mutate=None):
+            with tempfile.TemporaryDirectory() as directory:
+                run = Path(directory)
+                chunks = write_layout(run, [count])
+                write_asr(run, chunks[0], text)
+                mark_succeeded(run, "asr", chunks)
+                body = driver.load_protocol(run)
+                body["aligner_model_path"] = model
+                if policy:
+                    body["alignment_time_policy"] = driver.TAIL_TIME_POLICY
+                save_protocol(run, body)
+                calls = []
+                saved = {}
+
+                def launch(kind, chunk, output, protocol_body):
+                    calls.append(kind)
+                    record = align_record(chunk, text, [
+                        {"text": "甲", "start_time": 0.1, "end_time": 1.0},
+                        {"text": "乙", "start_time": 25.52, "end_time": 28.96},
+                    ])
+                    record["model_path"] = protocol_body["aligner_model_path"]
+                    if mutate is not None:
+                        mutate(record)
+                    driver.save_json(output, record)
+                    saved["sha"] = driver.file_sha256(output)
+                    saved["path"] = output
+                    return {"returncode": 0, "stderr": "", "elapsed_seconds": 0.2}
+
+                check(run, calls, saved, launch)
+
+        def check_refused_without_policy(run, calls, saved, launch):
+            with self.assertRaises(driver.StageBlocked):
+                driver.stage_align(run, launch=launch)
+            self.assertEqual(calls, ["align"])
+            failed = driver.load_json(run / "align-tasks.json")[0]
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["reason"], "validation:last-unit-out-of-bounds")
+            self.assertEqual(driver.load_json(saved["path"])["units"][-1]["end_time"], 28.96)
+            self.assertEqual(driver.file_sha256(saved["path"]), saved["sha"])
+            body = driver.load_protocol(run)
+            body["alignment_time_policy"] = driver.TAIL_TIME_POLICY
+            save_protocol(run, body)
+            with self.assertRaises(driver.StageBlocked):
+                driver.stage_align(run, launch=lambda *args: self.fail("failed checkpoint was retried"))
+            self.assertEqual(calls, ["align"])
+
+        def check_accepted(run, calls, saved, launch):
+            driver.stage_align(run, launch=launch)
+            self.assertEqual(calls, ["align"])
+            task = driver.load_json(run / "align-tasks.json")[0]
+            self.assertEqual(task["status"], "succeeded")
+            self.assertEqual(task["reason"], "aligned")
+            self.assertEqual(task["time_boundary_derivation"]["end_retracted_ticks"], 290000)
+            self.assertTrue(task["time_boundary_derivation"]["raw_preserved"])
+            self.assertEqual(driver.load_json(saved["path"])["units"][-1]["end_time"], 28.96)
+            self.assertEqual(driver.file_sha256(saved["path"]), saved["sha"])
+            self.assertEqual(
+                driver.parse_align_record(driver.load_json(saved["path"]), text, count, duration),
+                ["last-unit-out-of-bounds"],
+            )
+
+        def push_past(record):
+            record["units"][-1]["end_time"] = duration + 0.081
+
+        def check_too_wide(run, calls, saved, launch):
+            with self.assertRaises(driver.StageBlocked):
+                driver.stage_align(run, launch=launch)
+            self.assertEqual(calls, ["align"])
+            refused = driver.load_json(run / "align-tasks.json")[0]
+            self.assertEqual(refused["status"], "failed")
+            self.assertEqual(refused["reason"], "validation:last-unit-out-of-bounds")
+            self.assertNotEqual(refused["reason"], "aligned")
+            self.assertEqual(driver.file_sha256(saved["path"]), saved["sha"])
+
+        def overflow_earlier_unit(record):
+            record["units"][0]["end_time"] = duration + 0.02
+            record["units"][1]["start_time"] = duration + 0.03
+            record["units"][1]["end_time"] = duration + 0.05
+
+        def check_non_last(run, calls, saved, launch):
+            with self.assertRaises(driver.StageBlocked):
+                driver.stage_align(run, launch=launch)
+            self.assertEqual(calls, ["align"])
+            earlier = driver.load_json(run / "align-tasks.json")[0]
+            self.assertEqual(earlier["status"], "failed")
+            self.assertNotEqual(earlier["status"], "succeeded")
+            self.assertNotIn(earlier["reason"], ("aligned", "derived-tail-boundary-validated"))
+            self.assertEqual(driver.file_sha256(saved["path"]), saved["sha"])
+
+        run_align(False, check_refused_without_policy)
+        run_align(True, check_accepted)
+        run_align(True, check_too_wide, push_past)
+        run_align(True, check_non_last, overflow_earlier_unit)
+
     def test_ffmpeg_targets_protocol_audio_stream(self):
         command = driver.ffmpeg_arguments("/media/film.mp4", 1, "/tmp/full.wav", 12_088_100_000)
         self.assertEqual(command[0], "ffmpeg")

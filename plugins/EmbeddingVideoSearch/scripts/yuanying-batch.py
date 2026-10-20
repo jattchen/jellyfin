@@ -29,6 +29,7 @@ ASR_VERSION = "issue3-yuanying-asr-v1"
 EXPECTED_PROCESSING_ID = "eg2-7c43611ad2e20661c3d3"
 LANGUAGE_POLICY = "auto-v1"
 UNSUPPORTED_ALIGN_SKIP_POLICY = "unsupported-align-language-skip-v1"
+ALIGNMENT_TIME_POLICY = "last-unit-tail-80ms-v1"
 MODEL_CONCURRENCY = 1
 TRANSCRIBE_STAGES = ("prepare", "asr", "align", "documents")
 EMBED_STAGES = ("joint", "text")
@@ -226,6 +227,9 @@ def require_config(config):
     skip_policy = config.get("unsupportedAlignLanguagePolicy", None)
     if skip_policy not in (None, "", UNSUPPORTED_ALIGN_SKIP_POLICY):
         raise BatchBlocked("unknown unsupported align language policy", reason="language-policy")
+    tail_policy = config.get("alignmentTimePolicy", None)
+    if tail_policy not in (None, "", ALIGNMENT_TIME_POLICY):
+        raise BatchBlocked("unknown alignment time policy", reason="language-policy")
     for key in ("sourceDirectory", "sourceFacts", "outputRoot", "workerPython", "asrModel", "alignerModel"):
         if not config.get(key):
             raise BatchBlocked("config missing " + key, reason="config")
@@ -354,6 +358,8 @@ def root_protocol(config, films):
     }
     if config.get("unsupportedAlignLanguagePolicy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
         protocol["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
+    if config.get("alignmentTimePolicy") == ALIGNMENT_TIME_POLICY:
+        protocol["alignmentTimePolicy"] = ALIGNMENT_TIME_POLICY
     return protocol
 
 
@@ -373,6 +379,8 @@ def asr_protocol(record, config):
     }
     if config.get("unsupportedAlignLanguagePolicy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
         protocol["unsupported_align_language_policy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
+    if config.get("alignmentTimePolicy") == ALIGNMENT_TIME_POLICY:
+        protocol["alignment_time_policy"] = ALIGNMENT_TIME_POLICY
     return protocol
 
 
@@ -1233,6 +1241,8 @@ def preflight(config, *, check_model=False):
     }
     if config.get("unsupportedAlignLanguagePolicy") == UNSUPPORTED_ALIGN_SKIP_POLICY:
         summary["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
+    if config.get("alignmentTimePolicy") == ALIGNMENT_TIME_POLICY:
+        summary["alignmentTimePolicy"] = ALIGNMENT_TIME_POLICY
     if ready:
         write_json(Path(config["outputRoot"]) / "preflight.json", summary)
     return summary

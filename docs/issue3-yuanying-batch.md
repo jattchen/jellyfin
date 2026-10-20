@@ -12,6 +12,8 @@
 
 默认仍是上面这条严格规则。只有恢复配置显式写了 `unsupportedAlignLanguagePolicy`，而且值正好是 `unsupported-align-language-skip-v1` 时，才多一条窄规则：转写模型认识、对齐模型不支持、原因正好是 `language-unsupported` 的一小段，可以不进文字索引。这一小段保留原文、原文哈希、检测到的语言、原因和策略版本，状态是 `skipped`，`alignment_executed` 为 false。它不是对齐成功，也不是空文本，也不改成中文，也不编造时间。文字候选里没有它。缺语言、同一小段多种语言、不认识的语言、越界、超时、未知和其它错误仍然停下整批。已经失败的旧检查点不会被自动改成跳过。
 
+只有恢复配置另外显式写了 `alignmentTimePolicy`，而且值正好是 `last-unit-tail-80ms-v1` 时，才多一条时间规则。它只处理一种情况：对齐结果里只有最后一个字超出音频结尾，并且超出不超过 80 毫秒。这个字的结束时间收到音频结尾。原始对齐文件的字节不改。收过之后，仍用原来的 1 毫秒规则检查。这不是语言缺口，也不记成跳过。超过 80 毫秒、不是最后一个字、未知、超时和其它错误仍然停下整批，不会自动再跑。
+
 ## 怎样才算整部片完成
 
 一部片的覆盖记为 full，必须同时满足：准备、转写、对齐、分段、音画和文字都成功，而且窗口从 0 盖到这部片的真实结尾。每扇窗口都是完整的 12 秒，不能截短。摘录或只做完一部分，仍记为未完成。
@@ -69,6 +71,7 @@
   "maxInflightEmbeddings": 1,
   "transcriptionLanguagePolicy": "auto-v1",
   "unsupportedAlignLanguagePolicy": "unsupported-align-language-skip-v1",
+  "alignmentTimePolicy": "last-unit-tail-80ms-v1",
   "recoverySource": "$OLD_OUTPUT",
   "recoverySnapshot": "$V2_SNAPSHOT",
   "expectedFilmCount": 46,
@@ -80,7 +83,9 @@
 
 `$FROZEN_SOURCES` 是只读的冻结清单。`$EMPTY_TEMPLATE` 是空索引模板，文件名必须以 `.template.db` 结尾。`$NEW_INDEX_DIR` 必须是一个还不存在的新目录。输出目录不能放进样本目录、`asr-` 目录或正在使用的索引目录。
 
-`unsupportedAlignLanguagePolicy` 可以不写。不写时保持严格停下。恢复时才写上面的版本值。`recoverySource` 是旧输出目录，只读。`recoverySnapshot` 是这份旧输出的文件清单，每一项有路径、大小和 sha256。恢复前先核对清单和磁盘一致。新的 `outputRoot` 必须是另一个还不存在的目录。
+`unsupportedAlignLanguagePolicy` 可以不写。不写时保持严格停下。恢复时才写上面的版本值。`alignmentTimePolicy` 也可以不写。不写时，末字越界仍按失败停下。写了之后，只有新的、还没做完的转写协议会带上这条规则。已经做完的协议不会因为只改顶层配置而更新，所以要换一个新的输出目录。
+
+`recoverySource` 是旧输出目录，只读。`recoverySnapshot` 是这份旧输出的文件清单，每一项有路径、大小和 sha256。恢复前先核对清单和磁盘一致。新的 `outputRoot` 必须是另一个还不存在的目录。它可以和旧目录不在同一块盘上。
 
 ## 命令
 
@@ -95,7 +100,9 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py resume --config "$
 $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py import --config "$BATCH_CONFIG"
 ```
 
-要从旧的失败输出换到一个新目录时，用同一份恢复配置。它包含上面的批次字段，再加旧目录、快照和新的输出目录。准备只复制，不推理。
+要从旧的失败输出换到一个新目录时，用同一份恢复配置。它包含上面的批次字段，再加旧目录、快照和新的输出目录。准备只复制和离线复核，不推理。
+
+语言缺口那一次，先处理有缺口的那一部，再跑其余的：
 
 ```bash
 $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery.py prepare --config "$RECOVERY_CONFIG"
@@ -103,11 +110,32 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$REC
 $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
 ```
 
-`prepare` 先按快照核对旧目录的每一个文件。核对通过后，把已成功的产物逐个复制到新目录。复制是新的文件字节，不是硬链接，所以后来写入新目录不会改到旧文件。旧目录里的失败检查点、日志和运行身份都不改。只把那一处 `language-unsupported` 失败在新目录里记成跳过，并记下它来自哪一份旧检查点。哈希或身份对不上、还有别的失败、未知状态、孤立输出，都会拒绝，并且不改旧目录。再跑一次 `prepare` 时，新目录的字节如果和回执一致，就不再重写。`--film F006` 只进入这一部；确认它的音画完整、文字留有缺口之后，去掉 `--film` 再跑其余尚未完成的片。`--film` 可以重复。写了不存在的编号会拒绝。它不放宽失败即停。
+末字越界这一次，配置里要有 `alignmentTimePolicy`。先接受那一部已知的失败，再跑其余还没做完的：
+
+```bash
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery.py prepare --config "$RECOVERY_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG" --film F011
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
+```
+
+`prepare` 先按快照核对旧目录的每一个文件。核对通过后，把要保留的产物逐个复制到新目录。复制是按块读出再写入新文件，源和目标可以在两块盘上。新文件不是硬链接，后来写入新目录不会改到旧文件。
+
+旧清单里的绝对路径按下面四类处理：
+
+- 改绑切块音频：`chunks.json` 里的 `wav_path` 不沿用旧位置，也不打开那个旧路径。只有快照里的副本 sha256 等于这条切块的 `wav_sha256` 时，才改成新目录里的路径。缺文件或哈希不一致，就拒绝，而且这时还没有创建输出目录。
+- 改绑嵌入协议：每部片的 `asr_run`，以及 `shared_document_cache` 里的 `directory`。缓存对象的其它字段保留。
+- 保持原样：媒体路径、转写模型、对齐模型、`worker_python`、`prepare.json` 里的相对路径 `full_wav`，以及原始转写和对齐 JSON。已经做完的片子，转写协议字节保持原样，包括已经记成语言缺口的那一部。
+- 不复制：`preflight.json`、`progress.json`、旧的 `recovery-receipt.json`、`exit-receipt.json`、`run.log`、`run-identity.json`。旧目录里的这些文件不改。
+
+没有时间规则时，只把那一处 `language-unsupported` 失败在新目录里记成跳过，并记下它来自哪一份旧检查点。已经是跳过的语言缺口整份复制，不再派生一次。
+
+写了 `alignmentTimePolicy` 时，还要正好有一处原因是 `validation:last-unit-out-of-bounds` 的失败。准备阶段在新目录里离线复核这一处，不重新推理。原始对齐文件字节不变，旧目录里的失败记录也不变。新检查点的原因是 `derived-tail-boundary-validated`。这一部里还没对齐的块，留给后面的 `run` 继续对齐。还没做完的片子会带上这条时间规则；以后模型返回同样窄的末字越界时，对齐阶段就收口。超出 80 毫秒、不是最后一个字、还有别的失败、未知状态或孤立输出，都会拒绝整批准备，并且不改旧目录。
+
+再跑一次 `prepare` 时，新目录的字节如果和回执一致，就不再重写，也不再复核。`--film` 只进入点名的那一部。它可以重复。写了不存在的编号会拒绝。它不放宽失败即停。
 
 屏幕上的进度只显示 `F001` 这类编号、覆盖状态和数量，不显示路径、原文、向量或令牌。带路径的清单留在输出目录的私有文件里。
 
-`run` 和 `resume` 的退出码：0 表示每一部都是 full。1 表示准备未就绪，例如模型目录不完整。2 表示普通阶段失败、还有未完成的片，或已完成的片里仍有文字缺口。3 表示停在未知、超时或被打断的推理上。普通失败、未知和超时都会停住整批，不会继续下一部，也不会把未完成的结果写成 full。已经按规则跳过语言、并且音画已经完整的片，不会挡住下一部；这种批次退出 2，进度里有缺口，但没有 `stopped`。只跑 `--film` 时，没被点名的片保持原状态，整批因此也不是 0。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
+`run` 和 `resume` 的退出码：0 表示每一部都是 full。1 表示准备未就绪，例如模型目录不完整。2 表示普通阶段失败、还有未完成的片，或已完成的片里仍有文字缺口。3 表示停在未知、超时或被打断的推理上。普通失败、未知和超时都会停住整批，不会继续下一部，也不会把未完成的结果写成 full。已经按规则跳过语言、并且音画已经完整的片，不会挡住下一部；这种批次退出 2，进度里有缺口，但没有 `stopped`。只跑 `--film` 时，没被点名的片保持原状态，整批因此也不是 0。`--film F011` 时如果这一部没有硬失败，退出码也是 2，进度里没有 `stopped`。其余片都跑完以后，只要还留着文字缺口，退出码仍是 2，覆盖是 gapped，没有 `stopped`。退出码 2 并且进度里有 `stopped`，才是真的失败把整批停住。有文字缺口的片不导入。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
 
 导入产物是新目录里的 `prepared-index.db`。它保持 `manual_pause=1`、`imported_candidates_only=1` 和 `http://127.0.0.1:18784`。完成的片在索引里是 `complete`。不要打开正在运行的 `index.db`，也不要把 10 秒签名写进去。
 
