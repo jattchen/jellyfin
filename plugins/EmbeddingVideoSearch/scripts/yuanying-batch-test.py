@@ -1198,6 +1198,45 @@ class LanguageGapAndSelection(unittest.TestCase):
                     self.assertEqual(summary["stopped"], "F001")
                     self.assertNotEqual(summary["films"][1]["coverage"], "full")
 
+    def test_storage_interruption_authorization_does_not_resend_inflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            config = self.film_config(root, output)
+            config["unsupportedAlignLanguagePolicy"] = batch.UNSUPPORTED_ALIGN_SKIP_POLICY
+            config["alignmentTimePolicy"] = batch.ALIGNMENT_TIME_POLICY
+            config["storageInterruptionRecovery"] = {
+                "version": "storage-interruption-v1",
+                "film": "F011",
+                "candidate": "joint-named-once",
+                "inputHash": "ab" * 32,
+                "stateSha256": "cd" * 32,
+                "snapshotSha256": "ef" * 32,
+            }
+            batch.preflight(config)
+            film_dir = output / "films" / "F001"
+            succeed_transcription(film_dir, [])
+            batch.write_json(film_dir / "asr" / "align-language-gaps.json", [])
+            batch.write_json(film_dir / "asr" / "documents-state.json", {
+                "status": "succeeded", "text_coverage": "full", "gap_count": 0,
+            })
+            batch.publish_transcription(film_dir / "asr", film_dir / "embed")
+            protocol = batch.read_json(film_dir / "embed" / "protocol.json")
+            entry = protocol["joint_windows"][0]
+            batch.write_json(film_dir / "embed" / "joint" / (entry["candidate_id"] + ".state.json"), {
+                "candidate_id": entry["candidate_id"], "status": "inflight", "input_hash": "ab" * 32,
+            })
+            sent = []
+            code, summary = batch.run_batch(
+                config,
+                execute=lambda label, stage: sent.append((label, stage)) or 0,
+                send=lambda label, stage, item: sent.append(("send", label, item["candidate_id"])),
+            )
+            self.assertEqual(sent, [])
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertEqual(summary["films"][0]["status"], "inflight")
+
 
 if __name__ == "__main__":
     unittest.main()

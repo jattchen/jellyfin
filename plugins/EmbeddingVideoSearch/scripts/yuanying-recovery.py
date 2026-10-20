@@ -18,7 +18,12 @@ Absolute paths stored in the old tree are handled one class at a time:
 A settled language skip is copied as-is. When alignmentTimePolicy is
 last-unit-tail-80ms-v1, exactly one validation:last-unit-out-of-bounds failure
 is revalidated offline in the new directory. Any other failure refuses the
-whole prepare. This script does not run a model.
+whole prepare.
+
+storageInterruptionRecovery is a separate explicit mode. It copies a tree
+whose alignment is already finished, checks every succeeded joint, and leaves
+out one named inflight dispatch so the normal embed entry can send it once.
+It does not invent an align failure, and it does not run a model.
 """
 
 from __future__ import annotations
@@ -52,6 +57,15 @@ PENDING_FILM_FILES = {
     "sample-reuse-audit.json",
 }
 TAIL_REASON = "validation:last-unit-out-of-bounds"
+INTERRUPTION_MODE = "storage-interruption-v1"
+INTERRUPTION_FIELDS = (
+    "version",
+    "film",
+    "candidate",
+    "inputHash",
+    "stateSha256",
+    "snapshotSha256",
+)
 
 
 def load(name, filename):
@@ -745,6 +759,432 @@ def refresh_tail(output, plan, written):
     return written
 
 
+def hex64(value):
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def film_label(value):
+    if not isinstance(value, str) or len(value) != 4 or not value.startswith("F") or not value[1:].isdigit():
+        raise batch.BatchBlocked("interruption film must look like F011", reason="config")
+    return value
+
+
+def safe_file_name(value):
+    if not isinstance(value, str) or value in ("", ".", "..") or "/" in value or "\\" in value:
+        raise batch.BatchBlocked("interruption candidate is not a file name", reason="config")
+    return value
+
+
+def configured_interruption(config):
+    """Return the explicit whitelist, or None when this prepare is not that mode."""
+    value = config.get("storageInterruptionRecovery", None)
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict) or set(value) != set(INTERRUPTION_FIELDS):
+        raise batch.BatchBlocked("storage interruption authorization is incomplete", reason="config")
+    if value.get("version") != INTERRUPTION_MODE:
+        raise batch.BatchBlocked("unknown storage interruption mode", reason="config")
+    film_label(value.get("film"))
+    safe_file_name(value.get("candidate"))
+    for key in ("inputHash", "stateSha256", "snapshotSha256"):
+        if not hex64(value.get(key)):
+            raise batch.BatchBlocked("storage interruption hash is not 64 hex characters", reason="config")
+    return {key: value[key] for key in INTERRUPTION_FIELDS}
+
+
+def load_stored_json(path, label=None):
+    try:
+        return read_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise batch.BatchBlocked("stored record cannot be read", reason="source-mismatch", label=label) from exc
+
+
+def require_embedding(response, signature, kind, window, label):
+    try:
+        batch.embed.validate_response(response, signature, kind, window)
+    except AssertionError as exc:
+        raise batch.BatchBlocked(
+            "stored embedding does not match the model signature",
+            reason="signature-mismatch", label=label,
+        ) from exc
+
+
+def embedding_digest(protocol, kind, entry, clip_sha, label):
+    try:
+        digest, window = batch.embed.embedding_input(protocol, kind, entry, clip_sha)
+    except AssertionError as exc:
+        raise batch.BatchBlocked(
+            "stored embedding input cannot be checked",
+            reason="cache-hash-mismatch", label=label,
+        ) from exc
+    return digest, window
+
+
+def require_window(protocol, label):
+    try:
+        window = batch.embed.active_ten_second(protocol)
+    except AssertionError as exc:
+        raise batch.BatchBlocked(
+            "film window is not the 12-second contract",
+            reason="window-mismatch", label=label,
+        ) from exc
+    if window is None or window.get("version") != batch.contract.VERSION:
+        raise batch.BatchBlocked(
+            "film window is not the 12-second contract",
+            reason="window-mismatch", label=label,
+        )
+    return window
+
+
+def require_signature(protocol, expected, label):
+    found = protocol.get("signature")
+    if not isinstance(found, dict):
+        raise batch.BatchBlocked("film signature is missing", reason="signature-mismatch", label=label)
+    for key in ("id", "revision", "processing_id", "dimension", "normalized"):
+        if found.get(key) != expected.get(key):
+            raise batch.BatchBlocked("film signature does not match the frozen model", reason="signature-mismatch", label=label)
+    return found
+
+
+def clip_rels(label, candidate):
+    base = f"films/{label}/embed/clips/{candidate}"
+    return base + ".mp4", base + ".clip.json", base + ".partial.mp4"
+
+
+def same_clip_sha(checked, clip_rel, meta_rel, claimed, label):
+    if clip_rel not in checked or meta_rel not in checked:
+        raise batch.BatchBlocked("joint clip is missing", reason="source-mismatch", label=label)
+    meta = load_stored_json(checked[meta_rel]["path"], label)
+    file_sha = checked[clip_rel]["sha256"]
+    if not claimed or claimed != file_sha or meta.get("sha256") != file_sha:
+        raise batch.BatchBlocked("joint clip hash does not match", reason="cache-hash-mismatch", label=label)
+    return file_sha
+
+
+def audit_shared_documents(checked, signature, window):
+    prefix = "shared-document-cache/"
+    rels = [rel for rel in checked if rel.startswith(prefix)]
+    states, responses = [], []
+    for rel in rels:
+        name = rel[len(prefix):]
+        if "/" in name:
+            raise batch.BatchBlocked("shared document cache has an unexpected file", reason="source-mismatch")
+        if name.endswith(".state.json"):
+            states.append(rel)
+        elif name.endswith(".json"):
+            responses.append(rel)
+        else:
+            raise batch.BatchBlocked("shared document cache has an unexpected file", reason="source-mismatch")
+    if len(states) != len(responses):
+        raise batch.BatchBlocked("shared document cache has an orphan file", reason="source-mismatch")
+    reused = 0
+    for rel in states:
+        stem = Path(rel).name[: -len(".state.json")]
+        response_rel = prefix + stem + ".json"
+        if not hex64(stem) or response_rel not in checked:
+            raise batch.BatchBlocked("shared document cache has an orphan file", reason="source-mismatch")
+        state = load_stored_json(checked[rel]["path"])
+        if not isinstance(state, dict) or state.get("status") != "succeeded" or state.get("kind") != "document":
+            raise batch.BatchBlocked("unresolved shared document is not the authorized joint", reason="not-succeeded")
+        if state.get("input_hash") != stem or state.get("response_sha256") != checked[response_rel]["sha256"]:
+            raise batch.BatchBlocked("shared document hash does not match", reason="cache-hash-mismatch")
+        require_embedding(load_stored_json(checked[response_rel]["path"]), signature, "text", window, None)
+        reused += 1
+    return reused
+
+
+def audit_text(checked, label, protocol, signature, window):
+    prefix = f"films/{label}/embed/text/"
+    states = {}
+    responses = set()
+    for rel in checked:
+        if not rel.startswith(prefix):
+            continue
+        name = rel[len(prefix):]
+        if "/" in name:
+            raise batch.BatchBlocked("text embedding has an unexpected file", reason="source-mismatch", label=label)
+        if name.endswith(".state.json"):
+            states[name[: -len(".state.json")]] = rel
+        elif name.endswith(".json"):
+            responses.add(name[:-5])
+        else:
+            raise batch.BatchBlocked("text embedding has an unexpected file", reason="source-mismatch", label=label)
+    if not states and not responses:
+        return 0
+    candidates_rel = f"films/{label}/embed/candidates.json"
+    if candidates_rel not in checked:
+        raise batch.BatchBlocked("text embedding has no candidate list", reason="source-mismatch", label=label)
+    candidates = load_stored_json(checked[candidates_rel]["path"], label)
+    if not isinstance(candidates, list):
+        raise batch.BatchBlocked("text candidates are not a list", reason="source-mismatch", label=label)
+    by_id = {}
+    for entry in candidates:
+        if not isinstance(entry, dict):
+            raise batch.BatchBlocked("text candidate is incomplete", reason="source-mismatch", label=label)
+        candidate = entry.get("candidate_id")
+        if not isinstance(candidate, str) or candidate in ("", ".", "..") or "/" in candidate or "\\" in candidate:
+            raise batch.BatchBlocked("text candidate is not a file name", reason="source-mismatch", label=label)
+        if candidate in by_id:
+            raise batch.BatchBlocked("text candidate ids are duplicated", reason="source-mismatch", label=label)
+        by_id[candidate] = entry
+    reused = 0
+    for candidate, rel in states.items():
+        state = load_stored_json(checked[rel]["path"], label)
+        if not isinstance(state, dict) or state.get("status") != "succeeded":
+            raise batch.BatchBlocked(
+                "unresolved text dispatch is not the authorized joint",
+                reason="not-succeeded", label=label,
+            )
+        entry = by_id.get(candidate)
+        response_rel = prefix + candidate + ".json"
+        if entry is None or response_rel not in checked:
+            raise batch.BatchBlocked("text embedding does not match a candidate", reason="source-mismatch", label=label)
+        if state.get("response_sha256") != checked[response_rel]["sha256"]:
+            raise batch.BatchBlocked("text response hash does not match", reason="cache-hash-mismatch", label=label)
+        digest, _window = embedding_digest(protocol, "text", entry, None, label)
+        if state.get("input_hash") != digest:
+            raise batch.BatchBlocked("text input hash does not match", reason="cache-hash-mismatch", label=label)
+        require_embedding(load_stored_json(checked[response_rel]["path"], label), signature, "text", window, label)
+        reused += 1
+    orphans = responses - set(states)
+    if orphans:
+        raise batch.BatchBlocked("orphan text response", reason="source-mismatch", label=label)
+    return reused
+
+
+def audit_embeddings(source, checked, authorization, signature):
+    """Check joints before any output directory is created. Reads only."""
+    groups, _shared, _roots = film_groups(checked)
+    expected = batch.contract.signature_template(signature)
+    window = None
+    unknowns = []
+    omit_partials = []
+    referenced = set()
+    reused_joints = 0
+    reused_text = 0
+    not_started = 0
+    cached_without_dispatch = 0
+    for label, _rels in sorted(groups.items()):
+        protocol_rel = f"films/{label}/embed/protocol.json"
+        if protocol_rel not in checked:
+            raise batch.BatchBlocked("embed protocol is missing", reason="source-mismatch", label=label)
+        protocol = load_stored_json(checked[protocol_rel]["path"], label)
+        if not isinstance(protocol, dict):
+            raise batch.BatchBlocked("embed protocol is not an object", reason="source-mismatch", label=label)
+        film_window = require_window(protocol, label)
+        require_signature(protocol, expected, label)
+        window = film_window
+        windows = protocol.get("joint_windows") or []
+        if not isinstance(windows, list):
+            raise batch.BatchBlocked("joint windows are not a list", reason="source-mismatch", label=label)
+        seen = set()
+        for entry in windows:
+            if not isinstance(entry, dict):
+                raise batch.BatchBlocked("joint window is incomplete", reason="source-mismatch", label=label)
+            candidate = entry.get("candidate_id")
+            if not isinstance(candidate, str) or candidate in ("", ".", "..") or "/" in candidate or "\\" in candidate:
+                raise batch.BatchBlocked("joint candidate is not a file name", reason="source-mismatch", label=label)
+            if candidate in seen:
+                raise batch.BatchBlocked("joint candidate ids are duplicated", reason="source-mismatch", label=label)
+            seen.add(candidate)
+            state_rel = f"films/{label}/embed/joint/{candidate}.state.json"
+            response_rel = f"films/{label}/embed/joint/{candidate}.json"
+            clip_rel, meta_rel, partial_rel = clip_rels(label, candidate)
+            referenced.update(rel for rel in (state_rel, response_rel, clip_rel, meta_rel, partial_rel) if rel in checked)
+            has_state = state_rel in checked
+            has_response = response_rel in checked
+            has_clip = clip_rel in checked
+            has_meta = meta_rel in checked
+            has_partial = partial_rel in checked
+            if not has_state:
+                if has_response:
+                    raise batch.BatchBlocked("orphan joint response", reason="source-mismatch", label=label)
+                if has_partial and not has_clip and not has_meta:
+                    omit_partials.append(partial_rel)
+                    not_started += 1
+                    continue
+                if has_partial or has_clip != has_meta:
+                    raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=label)
+                if has_clip and has_meta:
+                    same_clip_sha(checked, clip_rel, meta_rel, load_stored_json(checked[meta_rel]["path"], label).get("sha256"), label)
+                    cached_without_dispatch += 1
+                    continue
+                not_started += 1
+                continue
+            state = load_stored_json(checked[state_rel]["path"], label)
+            if not isinstance(state, dict) or state.get("candidate_id") != candidate:
+                raise batch.BatchBlocked("joint state does not match its candidate", reason="source-mismatch", label=label)
+            status = state.get("status")
+            if status != "succeeded":
+                unknowns.append({
+                    "label": label,
+                    "candidate": candidate,
+                    "status": status,
+                    "inputHash": state.get("input_hash"),
+                    "stateSha256": checked[state_rel]["sha256"],
+                    "responsePresent": has_response,
+                    "stateRel": state_rel,
+                    "state": state,
+                    "protocol": protocol,
+                    "entry": entry,
+                    "hasPartial": has_partial,
+                })
+                continue
+            if has_partial:
+                raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=label)
+            if not has_response:
+                raise batch.BatchBlocked("succeeded joint is missing its response", reason="source-mismatch", label=label)
+            clip_sha = same_clip_sha(checked, clip_rel, meta_rel, (state.get("clip") or {}).get("sha256"), label)
+            if state.get("response_sha256") != checked[response_rel]["sha256"]:
+                raise batch.BatchBlocked("joint response hash does not match", reason="cache-hash-mismatch", label=label)
+            digest, checked_window = embedding_digest(protocol, "joint", entry, clip_sha, label)
+            if state.get("input_hash") != digest:
+                raise batch.BatchBlocked("joint input hash does not match", reason="cache-hash-mismatch", label=label)
+            require_embedding(
+                load_stored_json(checked[response_rel]["path"], label),
+                protocol["signature"], "joint", checked_window, label,
+            )
+            reused_joints += 1
+        reused_text += audit_text(checked, label, protocol, protocol["signature"], film_window)
+        prefix = f"films/{label}/embed/"
+        for rel in checked:
+            if not rel.startswith(prefix):
+                continue
+            name = rel[len(prefix):]
+            if name.startswith("joint/") or name.startswith("clips/"):
+                if rel not in referenced and name != "protocol.json":
+                    if rel.startswith(prefix + "joint/") or rel.startswith(prefix + "clips/"):
+                        raise batch.BatchBlocked("orphan joint file", reason="source-mismatch", label=label)
+    if window is None:
+        raise batch.BatchBlocked("recovery source has no embed protocol", reason="source-mismatch")
+    for rel in checked:
+        if rel.endswith(".partial.mp4") and rel not in omit_partials:
+            raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch")
+    if len(unknowns) != 1:
+        raise batch.BatchBlocked(
+            "storage interruption recovery requires exactly one unresolved joint",
+            reason="not-succeeded",
+        )
+    unknown = unknowns[0]
+    if (
+        unknown["label"] != authorization["film"]
+        or unknown["candidate"] != authorization["candidate"]
+        or unknown["inputHash"] != authorization["inputHash"]
+        or unknown["stateSha256"] != authorization["stateSha256"]
+    ):
+        raise batch.BatchBlocked(
+            "authorized joint does not match the inflight state",
+            reason="source-mismatch", label=unknown["label"],
+        )
+    if unknown["status"] != "inflight":
+        raise batch.BatchBlocked(
+            "authorized joint is not an inflight dispatch",
+            reason="not-succeeded", label=unknown["label"],
+        )
+    if unknown["responsePresent"]:
+        raise batch.BatchBlocked("inflight joint already has a response", reason="source-mismatch", label=unknown["label"])
+    if unknown["hasPartial"]:
+        raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=unknown["label"])
+    clip_rel, meta_rel, _partial_rel = clip_rels(unknown["label"], unknown["candidate"])
+    clip_sha = same_clip_sha(
+        checked, clip_rel, meta_rel,
+        (unknown["state"].get("clip") or {}).get("sha256"), unknown["label"],
+    )
+    digest, _window = embedding_digest(unknown["protocol"], "joint", unknown["entry"], clip_sha, unknown["label"])
+    if digest != authorization["inputHash"]:
+        raise batch.BatchBlocked("inflight input hash does not match the clip", reason="cache-hash-mismatch", label=unknown["label"])
+    reused_shared = audit_shared_documents(checked, expected, window)
+    evidence = {
+        "film": unknown["label"],
+        "candidate": unknown["candidate"],
+        "status": "inflight",
+        "inputHash": authorization["inputHash"],
+        "stateSha256": authorization["stateSha256"],
+        "responsePresent": False,
+        "sourceRelativePath": unknown["stateRel"],
+        "clipSha256": clip_sha,
+    }
+    return {
+        "reusedSucceededJoints": reused_joints,
+        "reusedSucceededText": reused_text,
+        "reusedSharedDocuments": reused_shared,
+        "notStartedJoints": not_started,
+        "cachedClipsWithoutDispatch": cached_without_dispatch,
+        "omit": [unknown["stateRel"], *omit_partials],
+        "omittedDispatch": [unknown["stateRel"]],
+        "omittedIncompleteClips": [
+            {"path": rel, "reason": "undispatched-partial", "successRecord": False}
+            for rel in omit_partials
+        ],
+        "unknownEvidence": evidence,
+    }
+
+
+def plan_interruption(source, checked, output, authorization, snapshot):
+    """Copy a finished alignment tree. Omit only the one authorized inflight state."""
+    groups, _shared, roots = film_groups(checked)
+    if "manifest.json" not in roots:
+        raise batch.BatchBlocked("snapshot has no manifest", reason="source-mismatch")
+    unexpected = [name for name in roots if name not in SKIPPED_ROOT_FILES and name != "manifest.json"]
+    if unexpected:
+        raise batch.BatchBlocked("unexpected recovery source file", reason="source-mismatch")
+    films = [classify_film(label, rels, source, checked) for label, rels in sorted(groups.items())]
+    for film in films:
+        if film["kind"] not in ("settled", "pending"):
+            raise batch.BatchBlocked(
+                "storage interruption recovery does not accept an unresolved transcription failure",
+                reason="transcription-failed", label=film["label"],
+            )
+    audit = audit_embeddings(source, checked, authorization, batch.EXPECTED_PROCESSING_ID)
+    omit = set(audit["omit"])
+    copies = []
+    rewrites = []
+    for rel in sorted(checked):
+        if rel in SKIPPED_ROOT_FILES or rel in omit:
+            continue
+        if rel == "manifest.json":
+            copies.append({"path": rel, "action": "copied", "source": rel})
+            continue
+        film_label_value = Path(rel).parts[1] if rel.startswith("films/") else None
+        if rel.endswith("/asr/chunks.json") and film_label_value is not None:
+            rewritten, changed = rebind_chunks(read_json(source / rel), output, checked, film_label_value)
+            if changed:
+                rewrites.append({
+                    "path": rel, "action": "rebound", "source": rel, "data": json_bytes(rewritten),
+                })
+                continue
+        if rel.endswith("/embed/protocol.json") and film_label_value is not None:
+            rewrites.append({
+                "path": rel,
+                "action": "rebound",
+                "source": rel,
+                "data": json_bytes(rebind_embed(read_json(source / rel), output, film_label_value)),
+            })
+            continue
+        copies.append({"path": rel, "action": "copied", "source": rel})
+    omitted = sorted(name for name in roots if name in SKIPPED_ROOT_FILES)
+    return {
+        "copies": copies,
+        "rewrites": rewrites,
+        "derived": None,
+        "tail": None,
+        "derivedTails": [],
+        "omittedSourceFiles": omitted,
+        "interruption": {
+            "authorization": {key: authorization[key] for key in INTERRUPTION_FIELDS},
+            "unknownEvidence": audit["unknownEvidence"],
+            "omittedDispatch": audit["omittedDispatch"],
+            "omittedIncompleteClips": audit["omittedIncompleteClips"],
+            "reusedSucceededJoints": audit["reusedSucceededJoints"],
+            "reusedSucceededText": audit["reusedSucceededText"],
+            "reusedSharedDocuments": audit["reusedSharedDocuments"],
+            "notStartedJoints": audit["notStartedJoints"],
+            "cachedClipsWithoutDispatch": audit["cachedClipsWithoutDispatch"],
+            "snapshotTotalBytes": int(snapshot["totalBytes"]),
+        },
+    }
+
+
 def receipt_body(config, snapshot_path, snapshot, plan, written):
     derived = plan.get("derived")
     skips = []
@@ -777,18 +1217,49 @@ def receipt_body(config, snapshot_path, snapshot, plan, written):
     }
     if plan.get("tail") is not None:
         body["alignmentTimePolicy"] = transcribe.TAIL_TIME_POLICY
+    interruption = plan.get("interruption")
+    if interruption is not None:
+        body["mode"] = INTERRUPTION_MODE
+        body["authorization"] = interruption["authorization"]
+        body["unknownEvidence"] = interruption["unknownEvidence"]
+        body["omittedDispatch"] = interruption["omittedDispatch"]
+        body["omittedIncompleteClips"] = interruption["omittedIncompleteClips"]
+        body["reusedSucceededJoints"] = interruption["reusedSucceededJoints"]
+        body["reusedSucceededText"] = interruption["reusedSucceededText"]
+        body["reusedSharedDocuments"] = interruption["reusedSharedDocuments"]
+        body["notStartedJoints"] = interruption["notStartedJoints"]
+        body["cachedClipsWithoutDispatch"] = interruption["cachedClipsWithoutDispatch"]
+        body["snapshotTotalBytes"] = interruption["snapshotTotalBytes"]
+        body["copyCount"] = len(plan["copies"])
+        body["rebindCount"] = len(plan["rewrites"])
+        body["modelRequests"] = 0
+        body["authorizedResends"] = 1
+        body["transcriptionAccuracyVerified"] = False
+        body["batchExitAccepted"] = False
     return body
 
 
-def confirm_idempotent(output, checked, tail_policy=None):
+def confirm_idempotent(output, checked, tail_policy=None, interruption=None):
     receipt_path = Path(output) / RECEIPT_NAME
     if not receipt_path.is_file():
         raise batch.BatchBlocked("recovery output exists without a receipt", reason="output-exists")
     receipt = read_json(receipt_path)
     if receipt.get("version") != RECEIPT_VERSION or receipt.get("policy") != POLICY or receipt.get("hardlink") is not False:
         raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
-    if (receipt.get("alignmentTimePolicy") or None) != (tail_policy or None):
-        raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+    if interruption is None:
+        if receipt.get("mode"):
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if (receipt.get("alignmentTimePolicy") or None) != (tail_policy or None):
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+    else:
+        if receipt.get("mode") != INTERRUPTION_MODE or receipt.get("authorization") != interruption:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("modelRequests") != 0 or receipt.get("authorizedResends") != 1:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("batchExitAccepted") is not False or receipt.get("transcriptionAccuracyVerified") is not False:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("snapshotSha256") != interruption["snapshotSha256"]:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
     expected = {item["path"]: item for item in receipt.get("files") or []}
     present = listed_files(output)
     present.pop(RECEIPT_NAME, None)
@@ -815,6 +1286,7 @@ def prepare(config):
     if config.get("unsupportedAlignLanguagePolicy") != POLICY:
         raise batch.BatchBlocked("recovery requires the explicit skip policy", reason="language-policy")
     tail_name = configured_tail(config)
+    interruption = configured_interruption(config)
     for key in ("recoverySource", "recoverySnapshot"):
         if not config.get(key):
             raise batch.BatchBlocked("config missing " + key, reason="config")
@@ -826,13 +1298,21 @@ def prepare(config):
     if batch.is_inside(output, source) or batch.is_inside(source, output):
         raise batch.BatchBlocked("recovery output overlaps the source", reason="preserved-artifact")
     snapshot, checked = load_snapshot(snapshot_path, source)
+    if interruption is not None and file_sha256(snapshot_path) != interruption["snapshotSha256"]:
+        raise batch.BatchBlocked(
+            "snapshot hash does not match the interruption authorization",
+            reason="source-mismatch",
+        )
     if output.exists():
         if not output.is_dir():
             raise batch.BatchBlocked("recovery output exists", reason="output-exists")
-        receipt = confirm_idempotent(output, checked, tail_name)
+        receipt = confirm_idempotent(output, checked, tail_name, interruption)
         source_unchanged(checked)
         return receipt
-    plan = plan_recovery(source, checked, output, tail_policy=tail_name is not None)
+    if interruption is not None:
+        plan = plan_interruption(source, checked, output, interruption, snapshot)
+    else:
+        plan = plan_recovery(source, checked, output, tail_policy=tail_name is not None)
     output.mkdir(mode=0o700)
     try:
         written = apply_plan(output, checked, plan)
@@ -851,7 +1331,7 @@ def prepare(config):
 
 def main(argv=None):
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description="把已完成的批次按字节复制到新目录。可派生一处语言缺口，或离线复核一处不超过 80 毫秒的末字越界。不推理。")
+    parser = argparse.ArgumentParser(description="把已完成的批次按字节复制到新目录。可派生一处语言缺口，离线复核一处不超过 80 毫秒的末字越界，或按显式白名单省略一处存储中断的音画请求。不推理。")
     parser.add_argument("command", choices=("prepare",))
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -872,6 +1352,15 @@ def main(argv=None):
     }
     if receipt.get("alignmentTimePolicy"):
         summary["alignmentTimePolicy"] = receipt["alignmentTimePolicy"]
+    if receipt.get("mode") == INTERRUPTION_MODE:
+        summary["mode"] = receipt["mode"]
+        summary["film"] = receipt["authorization"]["film"]
+        summary["candidate"] = receipt["authorization"]["candidate"]
+        summary["reusedSucceededJoints"] = receipt["reusedSucceededJoints"]
+        summary["modelRequests"] = receipt["modelRequests"]
+        summary["authorizedResends"] = receipt["authorizedResends"]
+        summary["batchExitAccepted"] = receipt["batchExitAccepted"]
+        summary["transcriptionAccuracyVerified"] = receipt["transcriptionAccuracyVerified"]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

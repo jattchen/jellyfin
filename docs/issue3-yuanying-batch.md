@@ -74,6 +74,14 @@
   "alignmentTimePolicy": "last-unit-tail-80ms-v1",
   "recoverySource": "$OLD_OUTPUT",
   "recoverySnapshot": "$V2_SNAPSHOT",
+  "storageInterruptionRecovery": {
+    "version": "storage-interruption-v1",
+    "film": "F011",
+    "candidate": "$ONE_JOINT_ID",
+    "inputHash": "$INPUT_HASH",
+    "stateSha256": "$STATE_SHA256",
+    "snapshotSha256": "$SNAPSHOT_SHA256"
+  },
   "expectedFilmCount": 46,
   "template": "$EMPTY_TEMPLATE",
   "references": "$REFERENCE_CACHE",
@@ -86,6 +94,8 @@
 `unsupportedAlignLanguagePolicy` 可以不写。不写时保持严格停下。恢复时才写上面的版本值。`alignmentTimePolicy` 也可以不写。不写时，末字越界仍按失败停下。写了之后，只有新的、还没做完的转写协议会带上这条规则。已经做完的协议不会因为只改顶层配置而更新，所以要换一个新的输出目录。
 
 `recoverySource` 是旧输出目录，只读。`recoverySnapshot` 是这份旧输出的文件清单，每一项有路径、大小和 sha256。恢复前先核对清单和磁盘一致。新的 `outputRoot` 必须是另一个还不存在的目录。它可以和旧目录不在同一块盘上。
+
+`storageInterruptionRecovery` 只在存储中断这一次填写。语言缺口和末字越界那两次不要写它。上面示例里的哈希都是占位，要换成快照和那一条状态文件的真实哈希。
 
 ## 命令
 
@@ -130,6 +140,20 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$REC
 没有时间规则时，只把那一处 `language-unsupported` 失败在新目录里记成跳过，并记下它来自哪一份旧检查点。已经是跳过的语言缺口整份复制，不再派生一次。
 
 写了 `alignmentTimePolicy` 时，还要正好有一处原因是 `validation:last-unit-out-of-bounds` 的失败。准备阶段在新目录里离线复核这一处，不重新推理。原始对齐文件字节不变，旧目录里的失败记录也不变。新检查点的原因是 `derived-tail-boundary-validated`。这一部里还没对齐的块，留给后面的 `run` 继续对齐。还没做完的片子会带上这条时间规则；以后模型返回同样窄的末字越界时，对齐阶段就收口。超出 80 毫秒、不是最后一个字、还有别的失败、未知状态或孤立输出，都会拒绝整批准备，并且不改旧目录。
+
+存储中断是另一条显式恢复，不能拿“正好有一处对齐失败”来套。配置里要有完整的 `storageInterruptionRecovery`：模式版本、片号、那一条音画候选、它的输入哈希、原来的状态文件哈希，以及这份快照文件自己的哈希。少任何一项，或者只写了候选编号，都不会放行。没写这个对象时，未知状态仍然整批拒绝。
+
+这条模式只接受对齐已经结束的目录。它不制造一处对齐失败，也不重新跑末字复核。已经写在转写协议里的 `recovery_origin` 按原字节复制，继续指向更早的那棵树。成功的音画在创建新目录之前逐条核对：切片哈希、输入哈希、响应哈希，以及模型、768 维、归一化和处理参数。文字和共享文档缓存里已经成功的记录也同样核对。对不上就拒绝，这时还没有新目录。
+
+未知请求只能有一条，而且必须是白名单上的那条：状态是 `inflight`，没有响应文件，切片和输入哈希一致。第二条未知、失败、`terminal-response`、孤立响应、半截切片或签名不对，都整批拒绝。明确没派发、也没有成功记录的 `.partial.mp4` 可以不复制进新目录，并写进回执；拿不准的残片就停下，不扩大重试。
+
+新目录里不放这一条 `inflight` 状态文件。原来的状态字节和哈希留在旧目录，并记在回执里。成功记录按字节复制。之后的普通嵌入入口会重新发送这一条，其余还没开始的窗口照常处理。如果新的一次又变成未知，原来的停止规则仍然生效，不会循环重试。准备阶段的模型请求数是 0。回执写明快照、白名单、复制和改绑、省略项、这条未知的原状态，以及复用了多少条成功音画。它不是整批成功退出，也不是转写准确性验收。
+
+```bash
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery.py prepare --config "$RECOVERY_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG" --film F011
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
+```
 
 再跑一次 `prepare` 时，新目录的字节如果和回执一致，就不再重写，也不再复核。`--film` 只进入点名的那一部。它可以重复。写了不存在的编号会拒绝。它不放宽失败即停。
 

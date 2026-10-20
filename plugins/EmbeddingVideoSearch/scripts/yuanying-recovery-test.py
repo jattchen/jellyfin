@@ -773,5 +773,470 @@ class TailRecovery(unittest.TestCase):
             self.assertFalse(output.exists())
 
 
+def unit_vector(index):
+    values = [0.0] * 768
+    values[index % 768] = 1.0
+    return values
+
+
+def joint_processing():
+    return {
+        "modalities": ["video", "audio"],
+        "video": {
+            "duration_seconds": 12.0, "audio_included": True, "has_audio": True,
+            "sampled_seconds": [0, 3, 6, 9], "offsets_seconds": [0, 3, 6, 9],
+            "frame_count": 4, "profile": batch.contract.PROFILE, "window_seconds": 12,
+            "max_soft_tokens": 70, "add_timestamps": False, "overflow_strategy": "reject",
+        },
+        "audio": {
+            "duration_seconds": 12.0, "sample_rate": 16000, "channels": 1,
+            "truncated": False, "coverage": "full_track",
+        },
+    }
+
+
+def embedding_response(signature, processing, vector):
+    return {
+        "model": signature["id"], "revision": signature["revision"],
+        "processing_id": signature["processing_id"], "dimension": 768, "normalized": True,
+        "data": [{"index": 0, "embedding": vector, "processing": processing}],
+    }
+
+
+class StorageInterruption(unittest.TestCase):
+    """Partial joint tree. No model call and no real recovery directory."""
+
+    def config(self, root, source, output, snapshot_path, authorization):
+        media = root / "library"
+        media.mkdir(parents=True, exist_ok=True)
+        (media / "film.mp4").write_bytes(b"film")
+        worker = root / "worker.py"
+        worker.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        (root / "facts.json").write_text("[]\n", encoding="utf-8")
+        body = {
+            "sourceDirectory": str(media),
+            "sourceFacts": str(root / "facts.json"),
+            "outputRoot": str(output),
+            "workerPython": str(worker),
+            "asrModel": str(root / "asr-model"),
+            "alignerModel": str(root / "align-model"),
+            "embeddingBaseUrl": batch.contract.ISOLATED_BASE,
+            "processingId": batch.EXPECTED_PROCESSING_ID,
+            "maxInflightEmbeddings": 1,
+            "transcriptionLanguagePolicy": "auto-v1",
+            "unsupportedAlignLanguagePolicy": recovery.POLICY,
+            "alignmentTimePolicy": batch.ALIGNMENT_TIME_POLICY,
+            "recoverySource": str(source),
+            "recoverySnapshot": str(snapshot_path),
+        }
+        if authorization is not None:
+            body["storageInterruptionRecovery"] = authorization
+        return body
+
+    def film_source(self, path, item, runtime):
+        return {
+            "itemId": item, "mediaSourceId": "mediasource",
+            "libraryId": "22222222-2222-4222-8222-222222222222",
+            "contentVersion": "content-fixed", "runtimeTicks": runtime,
+            "container": "mp4", "audioStreamIndex": 1, "sourceItemId": item,
+            "sourcePath": str(path), "sizeBytes": 4, "modifiedTicks": 1,
+        }
+
+    def embed_protocol(self, source, label, media, item, runtime):
+        signature = batch.contract.signature_template(batch.EXPECTED_PROCESSING_ID)
+        facts = self.film_source(media, item, runtime)
+        entries = batch.window_entries(facts)
+        return {
+            "version": "issue3-yuanying-film-v1",
+            "fullFilm": True,
+            "label": label,
+            "asr_run": str((source / "films" / label / "asr").resolve()),
+            "shared_document_cache": {
+                "directory": str((source / "shared-document-cache").resolve()),
+                "scope": "batch",
+            },
+            "embedding_base_url": batch.contract.ISOLATED_BASE,
+            "max_inflight_embeddings": 1,
+            "signature": signature,
+            "window": batch.contract.window_template(),
+            "source": facts,
+            "joint_windows": entries,
+            "worker_python": "/worker/python",
+            "transcription_language_policy": "auto-v1",
+        }
+
+    def write_clip(self, source, label, candidate, payload):
+        clip = source / "films" / label / "embed" / "clips" / f"{candidate}.mp4"
+        digest = write_bytes(clip, payload)
+        write_json(clip.with_suffix(".clip.json"), {"sha256": digest, "bytes": len(payload)})
+        return digest
+
+    def write_succeeded_joint(self, source, protocol, entry, vector):
+        label = protocol["label"]
+        candidate = entry["candidate_id"]
+        clip_sha = self.write_clip(source, label, candidate, b"clip-" + candidate.encode())
+        body = embedding_response(protocol["signature"], joint_processing(), vector)
+        response_sha = write_json(source / "films" / label / "embed" / "joint" / f"{candidate}.json", body)
+        digest, _window = batch.embed.embedding_input(protocol, "joint", entry, clip_sha)
+        write_json(source / "films" / label / "embed" / "joint" / f"{candidate}.state.json", {
+            "candidate_id": candidate, "status": "succeeded", "input_hash": digest,
+            "response_sha256": response_sha, "clip": {"sha256": clip_sha},
+        })
+        return digest
+
+    def write_transcription(self, source, label, protocol, *, origin=None, skipped=False):
+        asr = source / "films" / label / "asr"
+        write_json(asr / "protocol.json", protocol)
+        output_sha = write_bytes(asr / "asr" / "c0214.json", b"{\"text\":\"kept\"}\n")
+        align_sha = write_bytes(asr / "align" / "c0214.json", b"{\"end\":28.96}\n")
+        write_json(asr / "prepare.json", {"status": "succeeded", "full_wav": "audio/full.wav"})
+        write_json(asr / "chunks.json", [{"chunk_id": "c0214"}])
+        write_json(asr / "asr-tasks.json", [{
+            "chunk_id": "c0214", "status": "succeeded", "output_sha256": output_sha,
+        }])
+        if skipped:
+            task = {
+                "chunk_id": "c0214", "status": "skipped", "reason": "language-unsupported",
+                "skip_policy": recovery.POLICY, "alignment_executed": False,
+                "detected_language": "Dutch", "output_sha256": align_sha,
+            }
+        else:
+            task = {
+                "chunk_id": "c0214", "status": "succeeded",
+                "reason": "derived-tail-boundary-validated", "output_sha256": align_sha,
+            }
+        write_json(asr / "align-tasks.json", [task])
+        write_json(asr / "documents-state.json", {"status": "succeeded"})
+        write_json(asr / "candidates.json", [])
+        if origin is not None:
+            body = json.loads((asr / "protocol.json").read_text(encoding="utf-8"))
+            body["recovery_origin"] = {
+                "run": origin,
+                "align_tasks_sha256": hashlib.sha256((asr / "align-tasks.json").read_bytes()).hexdigest(),
+            }
+            body["alignment_time_policy"] = transcribe.TAIL_TIME_POLICY
+            body["unsupported_align_language_policy"] = recovery.POLICY
+            write_json(asr / "protocol.json", body)
+
+    def build(self, root, **flags):
+        source = root / "source"
+        media = root / "media-f011.mp4"
+        write_bytes(media, b"film")
+        signature = batch.contract.signature_template(batch.EXPECTED_PROCESSING_ID)
+        f011 = self.embed_protocol(
+            source, "F011", media, "11111111-1111-4111-8111-111111111111", 420_000_000)
+        self.assertEqual(len(f011["joint_windows"]), 4)
+        succeeded, inflight, partial, cached = f011["joint_windows"]
+        self.write_transcription(source, "F011", {
+            "version": "issue3-yuanying-asr-v1", "fullFilm": True, "label": "F011",
+            "transcription_language_policy": "auto-v1",
+            "worker_python": "/worker/python",
+            "asr_model_path": "/models/asr", "aligner_model_path": "/models/align",
+            "source": f011["source"],
+        }, origin="/older-tree/films/F011/asr")
+        wav_sha = write_bytes(source / "films" / "F011" / "asr" / "audio" / "chunks" / "c0214.wav", b"RIFFfake")
+        write_json(source / "films" / "F011" / "asr" / "chunks.json", [{
+            "chunk_id": "c0214", "wav_sha256": wav_sha,
+            "wav_path": "/old-v2/films/F011/asr/audio/chunks/c0214.wav",
+        }])
+        vector = [1.0, 0.0] if flags.get("bad_vector") else unit_vector(0)
+        self.write_succeeded_joint(source, f011, succeeded, vector)
+        if flags.get("bad_response_hash"):
+            state_path = source / "films" / "F011" / "embed" / "joint" / f"{succeeded['candidate_id']}.state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["response_sha256"] = "ab" * 32
+            write_json(state_path, state)
+        if flags.get("bad_clip_hash"):
+            meta = source / "films" / "F011" / "embed" / "clips" / f"{succeeded['candidate_id']}.clip.json"
+            body = json.loads(meta.read_text(encoding="utf-8"))
+            body["sha256"] = "ab" * 32
+            write_json(meta, body)
+        inflight_sha = self.write_clip(source, "F011", inflight["candidate_id"], b"clip-inflight")
+        inflight_hash, _window = batch.embed.embedding_input(f011, "joint", inflight, inflight_sha)
+        inflight_state = {
+            "candidate_id": inflight["candidate_id"], "status": "inflight",
+            "input_hash": inflight_hash, "clip": {"sha256": inflight_sha},
+            "source_facts": {"size": 4}, "started_at": 0,
+        }
+        if flags.get("terminal_response"):
+            inflight_state["status"] = "terminal-response"
+            write_json(source / "films" / "F011" / "embed" / "joint" / f"{inflight['candidate_id']}.json", {"http": 500})
+        if flags.get("inflight_response"):
+            write_json(source / "films" / "F011" / "embed" / "joint" / f"{inflight['candidate_id']}.json", {"http": 200})
+        if flags.get("authorized_succeeded"):
+            body = embedding_response(signature, joint_processing(), unit_vector(1))
+            response_sha = write_json(
+                source / "films" / "F011" / "embed" / "joint" / f"{inflight['candidate_id']}.json", body)
+            inflight_state["status"] = "succeeded"
+            inflight_state["response_sha256"] = response_sha
+        write_json(source / "films" / "F011" / "embed" / "joint" / f"{inflight['candidate_id']}.state.json", inflight_state)
+        write_bytes(
+            source / "films" / "F011" / "embed" / "clips" / f"{partial['candidate_id']}.partial.mp4",
+            b"partial-bytes",
+        )
+        if flags.get("half_clip"):
+            write_bytes(source / "films" / "F011" / "embed" / "clips" / f"{cached['candidate_id']}.mp4", b"half")
+        else:
+            self.write_clip(source, "F011", cached["candidate_id"], b"clip-cached")
+        if flags.get("second_unknown"):
+            cached_sha = hashlib.sha256((source / "films" / "F011" / "embed" / "clips" / f"{cached['candidate_id']}.mp4").read_bytes()).hexdigest()
+            cached_hash, _window = batch.embed.embedding_input(f011, "joint", cached, cached_sha)
+            write_json(source / "films" / "F011" / "embed" / "joint" / f"{cached['candidate_id']}.state.json", {
+                "candidate_id": cached["candidate_id"], "status": "inflight",
+                "input_hash": cached_hash, "clip": {"sha256": cached_sha},
+            })
+        if flags.get("orphan_response"):
+            write_json(source / "films" / "F011" / "embed" / "joint" / "orphan-joint.json", {"orphan": True})
+        write_json(source / "films" / "F011" / "embed" / "protocol.json", f011)
+        f001_media = root / "media-f001.mp4"
+        write_bytes(f001_media, b"film")
+        f001 = self.embed_protocol(
+            source, "F001", f001_media, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", batch.contract.LENGTH_TICKS)
+        self.write_transcription(source, "F001", {
+            "version": "issue3-yuanying-asr-v1", "fullFilm": True, "label": "F001",
+            "transcription_language_policy": "auto-v1", "source": f001["source"],
+        })
+        self.write_succeeded_joint(source, f001, f001["joint_windows"][0], unit_vector(2))
+        text_entry = {"candidate_id": "c0000-U01", "text": "synthetic line"}
+        text_hash, _window = batch.embed.embedding_input(f001, "text", text_entry)
+        text_body = embedding_response(signature, {"modalities": ["text"], "task": "document"}, unit_vector(5))
+        text_path = source / "films" / "F001" / "embed" / "text" / "c0000-U01.json"
+        if flags.get("text_unknown"):
+            write_json(source / "films" / "F001" / "embed" / "text" / "c0000-U01.state.json", {
+                "candidate_id": "c0000-U01", "status": "inflight", "input_hash": text_hash,
+            })
+        else:
+            text_sha = write_json(text_path, text_body)
+            write_json(source / "films" / "F001" / "embed" / "text" / "c0000-U01.state.json", {
+                "candidate_id": "c0000-U01", "status": "succeeded", "input_hash": text_hash,
+                "response_sha256": text_sha,
+            })
+        write_json(source / "films" / "F001" / "embed" / "candidates.json", [text_entry])
+        write_json(source / "films" / "F001" / "embed" / "protocol.json", f001)
+        f006_media = root / "media-f006.mp4"
+        write_bytes(f006_media, b"film")
+        f006 = self.embed_protocol(
+            source, "F006", f006_media, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", batch.contract.LENGTH_TICKS)
+        self.write_transcription(source, "F006", {
+            "version": "issue3-yuanying-asr-v1", "fullFilm": True, "label": "F006",
+            "transcription_language_policy": "auto-v1",
+            "unsupported_align_language_policy": recovery.POLICY,
+            "source": f006["source"],
+        }, skipped=True)
+        self.write_succeeded_joint(source, f006, f006["joint_windows"][0], unit_vector(3))
+        write_json(source / "films" / "F006" / "embed" / "protocol.json", f006)
+        f012 = self.embed_protocol(
+            source, "F012", root / "media-f012.mp4", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", batch.contract.LENGTH_TICKS)
+        write_json(source / "films" / "F012" / "asr" / "protocol.json", {
+            "transcription_language_policy": "auto-v1",
+            "unsupported_align_language_policy": recovery.POLICY,
+            "alignment_time_policy": transcribe.TAIL_TIME_POLICY,
+            "source": {"sourcePath": str(root / "media-f012.mp4")},
+        })
+        write_json(source / "films" / "F012" / "embed" / "protocol.json", f012)
+        document = {"candidate_id": "doc-1", "text": "synthetic document"}
+        document_hash, _window = batch.embed.embedding_input(f011, "text", document)
+        document_body = embedding_response(
+            signature, {"modalities": ["text"], "task": "document"}, unit_vector(4))
+        document_sha = write_json(source / "shared-document-cache" / f"{document_hash}.json", document_body)
+        write_json(source / "shared-document-cache" / f"{document_hash}.state.json", {
+            "status": "succeeded", "kind": "document", "input_hash": document_hash,
+            "response_sha256": document_sha,
+        })
+        write_json(source / "manifest.json", {"films": [{"label": "F011"}, {"label": "F001"}, {"label": "F006"}, {"label": "F012"}]})
+        write_bytes(source / "preflight.json", b"{\"ready\":true}\n")
+        write_bytes(source / "recovery-receipt.json", b"{\"marker\":\"old-recovery-receipt\"}\n")
+        snap = snapshot_for(source)
+        snap_path = root / "snapshot.json"
+        write_json(snap_path, snap)
+        state_path = source / "films" / "F011" / "embed" / "joint" / f"{inflight['candidate_id']}.state.json"
+        authorization = {
+            "version": recovery.INTERRUPTION_MODE,
+            "film": "F011",
+            "candidate": inflight["candidate_id"],
+            "inputHash": inflight_hash,
+            "stateSha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
+            "snapshotSha256": hashlib.sha256(snap_path.read_bytes()).hexdigest(),
+        }
+        if flags.get("wrong_candidate"):
+            authorization["candidate"] = "joint-not-the-inflight"
+        if flags.get("wrong_input"):
+            authorization["inputHash"] = "12" * 32
+        if flags.get("wrong_state"):
+            authorization["stateSha256"] = "34" * 32
+        if flags.get("wrong_snapshot"):
+            authorization["snapshotSha256"] = "56" * 32
+        return source, snap_path, authorization, inflight["candidate_id"]
+
+    def prepare(self, config):
+        original = batch.embed.dispatch
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("model dispatch")
+
+        batch.embed.dispatch = boom
+        try:
+            return recovery.prepare(config)
+        finally:
+            batch.embed.dispatch = original
+
+    def test_prepare_omits_only_the_authorized_inflight_joint(self):
+        source_text = Path(recovery.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("os.link", source_text)
+        self.assertNotIn("clonefile", source_text)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, snap_path, authorization, candidate = self.build(root)
+            output = root / "output"
+            before = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+            state_rel = f"films/F011/embed/joint/{candidate}.state.json"
+            nlink = os.lstat(source / state_rel).st_nlink
+            receipt = self.prepare(self.config(root, source, output, snap_path, authorization))
+            self.assertEqual(os.lstat(source / state_rel).st_nlink, 1)
+            self.assertEqual(nlink, 1)
+            after = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+            self.assertEqual(after, before)
+            self.assertFalse((output / state_rel).exists())
+            self.assertFalse((output / "preflight.json").exists())
+            self.assertFalse((output / "films" / "F011" / "asr" / "tail-revalidation.json").exists())
+            self.assertFalse((output / "films" / "F011" / "asr" / ".stage.lock").exists())
+            succeeded_id = json.loads((output / "films" / "F011" / "embed" / "protocol.json").read_text(encoding="utf-8"))["joint_windows"][0]["candidate_id"]
+            copied_response = output / "films" / "F011" / "embed" / "joint" / f"{succeeded_id}.json"
+            original_response = source / "films" / "F011" / "embed" / "joint" / f"{succeeded_id}.json"
+            self.assertEqual(copied_response.read_bytes(), original_response.read_bytes())
+            self.assertNotEqual(os.lstat(copied_response).st_ino, os.lstat(original_response).st_ino)
+            self.assertEqual(
+                (output / "films" / "F011" / "asr" / "protocol.json").read_bytes(),
+                (source / "films" / "F011" / "asr" / "protocol.json").read_bytes(),
+            )
+            self.assertIn("/older-tree/films/F011/asr", (output / "films" / "F011" / "asr" / "protocol.json").read_text(encoding="utf-8"))
+            self.assertNotIn(str(output), (output / "films" / "F011" / "asr" / "protocol.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                (output / "films" / "F011" / "asr" / "align" / "c0214.json").read_bytes(),
+                (source / "films" / "F011" / "asr" / "align" / "c0214.json").read_bytes(),
+            )
+            self.assertEqual(
+                (output / "films" / "F011" / "asr" / "align-tasks.json").read_bytes(),
+                (source / "films" / "F011" / "asr" / "align-tasks.json").read_bytes(),
+            )
+            self.assertEqual(
+                (output / "films" / "F001" / "asr" / "protocol.json").read_bytes(),
+                (source / "films" / "F001" / "asr" / "protocol.json").read_bytes(),
+            )
+            self.assertEqual(
+                (output / "films" / "F006" / "asr" / "align-tasks.json").read_bytes(),
+                (source / "films" / "F006" / "asr" / "align-tasks.json").read_bytes(),
+            )
+            self.assertEqual(
+                (output / "films" / "F012" / "asr" / "protocol.json").read_bytes(),
+                (source / "films" / "F012" / "asr" / "protocol.json").read_bytes(),
+            )
+            self.assertEqual((output / "manifest.json").read_bytes(), (source / "manifest.json").read_bytes())
+            chunks = json.loads((output / "films" / "F011" / "asr" / "chunks.json").read_text(encoding="utf-8"))
+            self.assertNotIn("/old-v2/", chunks[0]["wav_path"])
+            self.assertTrue(chunks[0]["wav_path"].endswith("films/F011/asr/audio/chunks/c0214.wav"))
+            rebound = json.loads((output / "films" / "F011" / "embed" / "protocol.json").read_text(encoding="utf-8"))
+            self.assertTrue(rebound["asr_run"].endswith("films/F011/asr"))
+            self.assertTrue(rebound["shared_document_cache"]["directory"].endswith("shared-document-cache"))
+            self.assertEqual(rebound["shared_document_cache"]["scope"], "batch")
+            self.assertEqual(rebound["source"]["sourcePath"], str(root / "media-f011.mp4"))
+            self.assertEqual(rebound["joint_windows"], f011_windows(source))
+            partial_name = rebound["joint_windows"][2]["candidate_id"] + ".partial.mp4"
+            self.assertFalse((output / "films" / "F011" / "embed" / "clips" / partial_name).exists())
+            self.assertTrue((source / "films" / "F011" / "embed" / "clips" / partial_name).is_file())
+            cached_id = rebound["joint_windows"][3]["candidate_id"]
+            self.assertTrue((output / "films" / "F011" / "embed" / "clips" / f"{cached_id}.mp4").is_file())
+            self.assertFalse((output / "films" / "F011" / "embed" / "joint" / f"{candidate}.state.json").exists())
+            self.assertTrue((output / "films" / "F011" / "embed" / "clips" / f"{candidate}.mp4").is_file())
+            digest, _window = batch.embed.embedding_input(rebound, "joint", rebound["joint_windows"][0], batch.joint_clip_sha(output / "films" / "F011" / "embed", rebound["joint_windows"][0]))
+            stored = json.loads((output / "films" / "F011" / "embed" / "joint" / f"{succeeded_id}.state.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["input_hash"], digest)
+            sent = []
+            decision = batch.dispatch_entries(
+                rebound["joint_windows"],
+                lambda entry: batch.state_for(output / "films" / "F011" / "embed", "joint", entry),
+                sent.append, rebound, "joint",
+                lambda entry: batch.joint_clip_sha(output / "films" / "F011" / "embed", entry),
+            )
+            self.assertEqual([item["candidate_id"] for item in sent], [
+                rebound["joint_windows"][1]["candidate_id"],
+                rebound["joint_windows"][2]["candidate_id"],
+                rebound["joint_windows"][3]["candidate_id"],
+            ])
+            self.assertEqual(decision["reused"], [succeeded_id])
+            self.assertFalse(decision["resentUnknown"])
+            self.assertEqual(receipt["mode"], recovery.INTERRUPTION_MODE)
+            self.assertEqual(receipt["authorization"], authorization)
+            self.assertEqual(receipt["modelRequests"], 0)
+            self.assertEqual(receipt["authorizedResends"], 1)
+            self.assertIs(receipt["batchExitAccepted"], False)
+            self.assertIs(receipt["transcriptionAccuracyVerified"], False)
+            self.assertEqual(receipt["reusedSucceededJoints"], 3)
+            self.assertEqual(receipt["notStartedJoints"], 2)
+            self.assertEqual(receipt["cachedClipsWithoutDispatch"], 1)
+            self.assertEqual(receipt["omittedDispatch"], [state_rel])
+            self.assertEqual(receipt["unknownEvidence"]["status"], "inflight")
+            self.assertIs(receipt["unknownEvidence"]["responsePresent"], False)
+            self.assertEqual(receipt["unknownEvidence"]["stateSha256"], authorization["stateSha256"])
+            self.assertEqual(receipt["omittedIncompleteClips"], [{
+                "path": f"films/F011/embed/clips/{partial_name}",
+                "reason": "undispatched-partial",
+                "successRecord": False,
+            }])
+            self.assertIn("preflight.json", receipt["omittedSourceFiles"])
+            self.assertIn("recovery-receipt.json", receipt["omittedSourceFiles"])
+            self.assertNotIn("synthetic document", json.dumps(receipt))
+            self.assertNotIn("source_facts", json.dumps(receipt["unknownEvidence"]))
+            again = self.prepare(self.config(root, source, output, snap_path, authorization))
+            self.assertEqual(again, receipt)
+            without = dict(self.config(root, source, output, snap_path, authorization))
+            without.pop("storageInterruptionRecovery")
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                self.prepare(without)
+            self.assertEqual(caught.exception.reason, "output-exists")
+            copied_response.write_bytes(copied_response.read_bytes() + b"\n")
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                self.prepare(self.config(root, source, output, snap_path, authorization))
+            self.assertEqual(caught.exception.reason, "output-exists")
+
+    def test_refusals_happen_before_output(self):
+        cases = (
+            ({"omit_authorization": True}, "transcription-failed"),
+            ({"wrong_candidate": True}, "source-mismatch"),
+            ({"wrong_input": True}, "source-mismatch"),
+            ({"wrong_state": True}, "source-mismatch"),
+            ({"wrong_snapshot": True}, "source-mismatch"),
+            ({"second_unknown": True}, "not-succeeded"),
+            ({"terminal_response": True}, "not-succeeded"),
+            ({"inflight_response": True}, "source-mismatch"),
+            ({"authorized_succeeded": True}, "not-succeeded"),
+            ({"orphan_response": True}, "source-mismatch"),
+            ({"bad_response_hash": True}, "cache-hash-mismatch"),
+            ({"bad_clip_hash": True}, "cache-hash-mismatch"),
+            ({"bad_vector": True}, "signature-mismatch"),
+            ({"half_clip": True}, "source-mismatch"),
+            ({"text_unknown": True}, "not-succeeded"),
+        )
+        for flags, reason in cases:
+            with self.subTest(flags=flags):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    options = dict(flags)
+                    omit = options.pop("omit_authorization", False)
+                    source, snap_path, authorization, _candidate = self.build(root, **options)
+                    output = root / "output"
+                    before = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+                    with self.assertRaises(batch.BatchBlocked) as caught:
+                        self.prepare(self.config(root, source, output, snap_path, None if omit else authorization))
+                    self.assertEqual(caught.exception.reason, reason)
+                    self.assertFalse(output.exists())
+                    after = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+                    self.assertEqual(after, before)
+
+
+def f011_windows(source):
+    return json.loads((source / "films" / "F011" / "embed" / "protocol.json").read_text(encoding="utf-8"))["joint_windows"]
+
+
 if __name__ == "__main__":
     unittest.main()
