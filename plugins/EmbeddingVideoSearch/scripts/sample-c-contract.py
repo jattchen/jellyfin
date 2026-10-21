@@ -243,27 +243,60 @@ def ticks_to_seconds(ticks):
     return f"{seconds}.{remainder:07d}"
 
 
+def _is_attached_picture(stream):
+    if not isinstance(stream, dict):
+        return False
+    disposition = stream.get("disposition") or {}
+    if not isinstance(disposition, dict):
+        disposition = {}
+    if disposition.get("attached_pic") in (1, True):
+        return True
+    return stream.get("codec_name") == "mjpeg"
+
+
+def _program_video(probe):
+    """The one real picture, plus cover-art indexes. Covers are not pictures."""
+    pictures = []
+    attached = []
+    for stream in list((probe or {}).get("streams") or []):
+        if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+            continue
+        if _is_attached_picture(stream):
+            try:
+                attached.append(int(stream["index"]))
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ContractError("attached picture stream is missing") from exc
+            continue
+        pictures.append(stream)
+    if not pictures:
+        raise ContractError("program video stream is missing")
+    if len(pictures) != 1:
+        raise ContractError("more than one program video stream")
+    video = pictures[0]
+    if video.get("codec_name") in (None, ""):
+        raise ContractError("program video codec is missing")
+    try:
+        video_index = int(video["index"])
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ContractError("program video stream is missing") from exc
+    return video, video_index, attached
+
+
 def check_source_probe(probe, audio_stream_index):
+    video, video_index, attached = _program_video(probe)
+    try:
+        audio_index = int(audio_stream_index)
+    except (TypeError, ValueError) as exc:
+        raise ContractError("audio map must be the absolute audio stream") from exc
     streams = list((probe or {}).get("streams") or [])
-    video = next((stream for stream in streams if stream.get("index") == 0), None)
-    if video is None or video.get("codec_type") != "video" or video.get("codec_name") in (None, "", "mjpeg"):
-        raise ContractError("stream 0 must be the program video")
-    if (video.get("disposition") or {}).get("attached_pic") in (1, True):
-        raise ContractError("stream 0 is an attached picture")
-    audio_index = int(audio_stream_index)
     audio = next((stream for stream in streams if stream.get("index") == audio_index), None)
     if audio is None or audio.get("codec_type") != "audio":
         raise ContractError("audio map must be the absolute audio stream")
-    attached = []
-    for stream in streams:
-        if stream.get("codec_type") != "video" or stream.get("index") == 0:
-            continue
-        is_attached = stream.get("codec_name") == "mjpeg" or (stream.get("disposition") or {}).get("attached_pic") in (1, True)
-        if not is_attached:
-            raise ContractError("an extra video stream is not an attached picture")
-        attached.append(int(stream["index"]))
+    # Index 0 keeps the historical map so existing clip identities still match.
+    video_map = "0:v:0" if video_index == 0 else f"0:{video_index}"
     return {
-        "video_map": "0:v:0",
+        "video_map": video_map,
+        "video_stream_index": video_index,
         "audio_map": f"0:{audio_index}",
         "video_start_time_raw": video.get("start_time"),
         "video_start_added": False,
@@ -619,8 +652,11 @@ def _seconds_text(value):
 
 def classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=None):
     """Classify a frozen source end. This does not open the media."""
+    try:
+        video, _video_index, _attached = _program_video(probe)
+    except ContractError:
+        return {"status": "unknown"}
     streams = list((probe or {}).get("streams") or [])
-    video = next((stream for stream in streams if stream.get("index") == 0 and stream.get("codec_type") == "video"), None)
     try:
         audio_index = int(audio_stream_index)
     except (TypeError, ValueError):
@@ -628,17 +664,20 @@ def classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=Non
     audio = None if audio_index is None else next((stream for stream in streams if stream.get("index") == audio_index), None)
     video_end = _stream_duration(video)
     audio_end = _stream_duration(audio)
-    if video is None or audio is None or audio.get("codec_type") != "audio" or video_end is None or audio_end is None:
+    if audio is None or audio.get("codec_type") != "audio" or video_end is None or audio_end is None:
         return {"status": "unknown"}
     runtime = Decimal(int(runtime_ticks)) / Decimal(10_000_000)
-    if abs(audio_end - runtime) > Decimal("0.001"):
-        return {"status": "unknown"}
     gap = audio_end - video_end
     record = {
         "gapSeconds": _seconds_text(gap),
         "videoEndSeconds": _seconds_text(video_end),
         "audioEndSeconds": _seconds_text(audio_end),
     }
+    # The container took the longer picture. That is not a picture pad.
+    if gap < 0 and abs(video_end - runtime) <= Decimal("0.001"):
+        return {"status": "none", **record}
+    if abs(audio_end - runtime) > Decimal("0.001"):
+        return {"status": "unknown"}
     if gap <= 0:
         return {"status": "none", **record}
     if gap > VIDEO_TAIL_LIMIT:
@@ -686,9 +725,15 @@ def hold_last_frame(probe, audio_stream_index, runtime_ticks, end_ticks, policy,
     return decision
 
 
-def probe_frame_rate(source_path):
+def probe_frame_rate(source_path, video_stream_index=0):
+    try:
+        selector = str(int(video_stream_index))
+    except (TypeError, ValueError) as exc:
+        raise ContractError("video tail frame rate is unknown") from exc
+    if int(selector) < 0:
+        raise ContractError("video tail frame rate is unknown")
     completed = subprocess.run(
-        ["/usr/local/bin/ffprobe", "-v", "error", "-select_streams", "v:0",
+        ["/usr/local/bin/ffprobe", "-v", "error", "-select_streams", selector,
          "-show_entries", "stream=r_frame_rate", "-of", "json", str(source_path)],
         check=False, capture_output=True, timeout=20,
     )
@@ -707,6 +752,7 @@ def probe_frame_rate(source_path):
 
 def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe, video_tail_extension=None):
     facts = check_source_probe(probe, audio_stream_index)
+    video_map = facts["video_map"]
     start = ticks_to_seconds(int(start_ticks))
     arguments = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-accurate_seek",
@@ -717,12 +763,12 @@ def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe
             raise ContractError("video tail extension is not a duration")
         arguments.extend([
             "-filter_complex",
-            "[0:v:0]tpad=stop_mode=clone:stop_duration=" + str(video_tail_extension) + "[v]",
+            "[" + video_map + "]tpad=stop_mode=clone:stop_duration=" + str(video_tail_extension) + "[v]",
             "-map", "[v]",
         ])
     arguments.extend(["-t", "12"])
     if not video_tail_extension:
-        arguments.extend(["-map", "0:v:0"])
+        arguments.extend(["-map", video_map])
     arguments.extend([
         "-map", facts["audio_map"],
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
@@ -747,7 +793,8 @@ def decide_video_tail_hold(source, probe, end, policy):
         probe, source["audioStreamIndex"], source["runtimeTicks"], end, policy)
     if not preliminary or not preliminary.get("needsFrameRate"):
         return preliminary
-    rate = probe_frame_rate(source["sourcePath"])
+    facts = check_source_probe(probe, source["audioStreamIndex"])
+    rate = probe_frame_rate(source["sourcePath"], facts["video_stream_index"])
     return hold_last_frame(
         probe, source["audioStreamIndex"], source["runtimeTicks"], end, policy, frame_rate=rate)
 
@@ -773,7 +820,7 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
     identity = {
         "source": source_facts(source), "start_ticks": start, "end_ticks": end,
         "profile": INPUT_VERSION, "threads": 2, "audio_stream_index": source["audioStreamIndex"],
-        "window_version": VERSION, "video_map": "0:v:0", "audio_map": facts["audio_map"],
+        "window_version": VERSION, "video_map": facts["video_map"], "audio_map": facts["audio_map"],
         "time_origin": "container", "video_start_added": False,
         "video_start_time_raw": facts["video_start_time_raw"],
         "attached_picture_stream_indexes": facts["attached_picture_stream_indexes"],

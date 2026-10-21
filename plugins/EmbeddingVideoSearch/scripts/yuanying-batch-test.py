@@ -1268,18 +1268,62 @@ class VideoTailBatch(unittest.TestCase):
             within = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
             within["probe"] = duration_probe("12.000000", "11.850113")
             unknown = source_file(root / "media", "film-F002.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F002")
-            unknown["probe"] = duration_probe("12.000000", "11.900000", video_first=False)
-            config = config_for(root, [within, unknown], output)
+            unknown["probe"] = {"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.000000"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "12.000000"},
+            ]}
+            longer = source_file(root / "media", "film-F003.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F003")
+            longer["probe"] = duration_probe("11.850000", "12.000000")
+            swapped = source_file(root / "media", "film-F004.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F004")
+            swapped["source"]["audioStreamIndex"] = 0
+            swapped["probe"] = duration_probe("12.000000", "11.900000", video_first=False)
+            config = config_for(root, [within, unknown, longer, swapped], output)
             config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
             summary = batch.preflight(config)
             self.assertEqual(summary["videoTailPolicy"], contract.VIDEO_TAIL_POLICY)
-            self.assertEqual(summary["videoTailRisk"]["withinBound"], ["F001"])
+            self.assertEqual(summary["videoTailRisk"]["withinBound"], ["F001", "F004"])
             self.assertEqual(summary["videoTailRisk"]["unknown"], ["F002"])
             self.assertEqual(summary["videoTailRisk"]["overBound"], [])
+            self.assertNotIn("F003", summary["videoTailRisk"]["withinBound"])
+            self.assertNotIn("F003", summary["videoTailRisk"]["unknown"])
+            maps = {item["label"]: item for item in summary["pictureMap"]}
+            self.assertEqual(maps["F001"]["videoMap"], "0:v:0")
+            self.assertEqual(maps["F004"]["videoMap"], "0:1")
+            self.assertEqual(maps["F004"]["audioStream"], 0)
+            self.assertEqual(maps["F004"]["videoStream"], 1)
             protocol = batch.read_json(output / "films" / "F001" / "embed" / "protocol.json")
             self.assertEqual(protocol["video_tail_policy"], contract.VIDEO_TAIL_POLICY)
             asr = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
             self.assertNotIn("video_tail_policy", asr)
+
+    def test_known_bad_picture_map_refuses_before_output(self):
+        cases = [
+            {"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "duration": "12.000000"},
+                {"index": 1, "codec_type": "video", "codec_name": "hevc", "duration": "12.000000"},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac", "duration": "12.000000"},
+            ], "audio": 2},
+            {"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "duration": "12.000000"},
+            ], "audio": 1},
+            {"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "duration": "12.000000"},
+            ], "audio": 1},
+        ]
+        for case in cases:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "output"
+                row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+                row["source"]["audioStreamIndex"] = case["audio"]
+                row["probe"] = {"streams": case["streams"]}
+                config = config_for(root, [row], output)
+                config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+                with self.assertRaises(batch.BatchBlocked) as caught:
+                    batch.preflight(config)
+                self.assertEqual(caught.exception.reason, "probe-map")
+                self.assertFalse(output.exists())
 
     def test_clip_rejection_records_the_stage_and_stops(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1199,6 +1199,26 @@ def collect_video_tail_risk(films):
     return {"withinBound": within, "overBound": over, "unknown": unknown}
 
 
+def picture_maps(films):
+    """Name the one real picture and the configured audio stream. Refuse a known mismatch."""
+    mapped = []
+    for film in films:
+        try:
+            facts = contract.check_source_probe(film.get("probe"), film["source"]["audioStreamIndex"])
+        except contract.ContractError as exc:
+            raise BatchBlocked(
+                "frozen probe does not name one real picture stream and the configured audio stream",
+                reason="probe-map", label=film.get("label"),
+            ) from exc
+        mapped.append({
+            "label": film["label"],
+            "videoStream": facts["video_stream_index"],
+            "audioStream": int(film["source"]["audioStreamIndex"]),
+            "videoMap": facts["video_map"],
+        })
+    return mapped
+
+
 def preflight(config, *, check_model=False):
     require_config(config)
     output = Path(config["outputRoot"])
@@ -1232,7 +1252,9 @@ def preflight(config, *, check_model=False):
     if expected is not None and int(expected) != len(films):
         ready = False
     video_tails = None
+    picture_map = None
     if config.get("videoTailPolicy") == contract.VIDEO_TAIL_POLICY:
+        picture_map = picture_maps(films)
         video_tails = collect_video_tail_risk(films)
         if video_tails["overBound"]:
             raise BatchBlocked(
@@ -1278,6 +1300,7 @@ def preflight(config, *, check_model=False):
     if video_tails is not None:
         summary["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
         summary["videoTailRisk"] = video_tails
+        summary["pictureMap"] = picture_map
     if ready:
         write_json(Path(config["outputRoot"]) / "preflight.json", summary)
     return summary

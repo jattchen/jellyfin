@@ -255,6 +255,141 @@ class VideoTailHold(unittest.TestCase):
             opening = gray_frame(source_path, 0)
             self.assertLess(mean_abs(pad, last), mean_abs(pad, opening))
 
+    def test_index_zero_picture_keeps_the_historical_map(self):
+        facts = contract.check_source_probe(stream_probe("12.000000", "12.000000"), 1)
+        self.assertEqual(facts["video_map"], "0:v:0")
+        self.assertEqual(facts["video_stream_index"], 0)
+        self.assertEqual(facts["audio_map"], "0:1")
+
+    def test_audio_before_the_picture_selects_that_picture(self):
+        probe = {"streams": [
+            {"index": 0, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "139.923447"},
+            {"index": 1, "codec_type": "video", "codec_name": "h264", "start_time": "0.000000", "duration": "139.866667",
+             "width": 160, "height": 120},
+        ]}
+        facts = contract.check_source_probe(probe, 0)
+        self.assertEqual(facts["video_map"], "0:1")
+        self.assertEqual(facts["video_stream_index"], 1)
+        self.assertEqual(facts["audio_map"], "0:0")
+        self.assertEqual(facts["attached_picture_stream_indexes"], [])
+        decision = contract.classify_video_tail(probe, 0, 1_399_234_470)
+        self.assertEqual(decision["status"], "within-bound")
+        self.assertEqual(decision["gapSeconds"], "0.056780")
+        plain, _facts = contract.clip_ffmpeg_arguments("/media/film.mp4", 0, 0, "/tmp/out.mp4", probe)
+        self.assertEqual(plain[plain.index("-map") + 1], "0:1")
+        self.assertIn("0:0", plain)
+        self.assertNotIn("0:v:0", plain)
+        held, _facts = contract.clip_ffmpeg_arguments("/media/film.mp4", 0, 0, "/tmp/out.mp4", probe, "0.066667")
+        self.assertIn("[0:1]tpad=stop_mode=clone:stop_duration=0.066667[v]", held)
+        self.assertNotIn("0:v:0", held)
+
+    def test_cover_duplicate_and_missing_audio_are_refused(self):
+        cover_first = {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1},
+             "duration": "0.040000"},
+            {"index": 1, "codec_type": "video", "codec_name": "h264", "start_time": "0.000000", "duration": "12.000000"},
+            {"index": 2, "codec_type": "audio", "codec_name": "aac", "duration": "12.000000"},
+        ]}
+        facts = contract.check_source_probe(cover_first, 2)
+        self.assertEqual(facts["video_map"], "0:1")
+        self.assertEqual(facts["audio_map"], "0:2")
+        self.assertEqual(facts["attached_picture_stream_indexes"], [0])
+        plain, _facts = contract.clip_ffmpeg_arguments("/media/film.mp4", 0, 2, "/tmp/out.mp4", cover_first)
+        self.assertIn("0:1", plain)
+        self.assertIn("0:2", plain)
+        self.assertNotIn("0:v:0", plain)
+        self.assertNotIn("0:0", plain)
+        duplicate = {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "duration": "12.000000"},
+            {"index": 1, "codec_type": "video", "codec_name": "hevc", "duration": "12.000000"},
+            {"index": 2, "codec_type": "audio", "codec_name": "aac", "duration": "12.000000"},
+        ]}
+        with self.assertRaises(contract.ContractError) as caught:
+            contract.check_source_probe(duplicate, 2)
+        self.assertIn("more than one", str(caught.exception))
+        cover_only = {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "duration": "12.000000"},
+        ]}
+        with self.assertRaises(contract.ContractError) as caught:
+            contract.check_source_probe(cover_only, 1)
+        self.assertIn("missing", str(caught.exception))
+        with self.assertRaises(contract.ContractError) as caught:
+            contract.check_source_probe(stream_probe("12.000000", "12.000000"), 3)
+        self.assertIn("audio", str(caught.exception))
+
+    def test_longer_picture_is_not_a_hold_and_short_audio_still_fails(self):
+        probe = stream_probe("11.850000", "12.000000")
+        decision = contract.classify_video_tail(probe, 1, 120_000_000)
+        self.assertEqual(decision["status"], "none")
+        self.assertNotIn("extensionSeconds", decision)
+        source = {"audioStreamIndex": 1, "runtimeTicks": 120_000_000, "sourcePath": "/media/film.mp4"}
+        calls = []
+        original = contract.probe_frame_rate
+        contract.probe_frame_rate = lambda *_args: calls.append("probe") or "30/1"
+        try:
+            self.assertIsNone(contract.decide_video_tail_hold(
+                source, probe, 120_000_000, contract.VIDEO_TAIL_POLICY))
+        finally:
+            contract.probe_frame_rate = original
+        self.assertEqual(calls, [])
+        self.assertTrue(contract.clip_duration_accepted(11.985))
+        self.assertTrue(contract.audio_covers_clip(11.985, 12.0))
+        self.assertFalse(contract.clip_duration_accepted(11.833333))
+        self.assertFalse(contract.audio_covers_clip(11.833333, 12.0))
+        mismatched = stream_probe("11.700000", "11.800000")
+        self.assertEqual(contract.classify_video_tail(mismatched, 1, 120_000_000)["status"], "unknown")
+        with self.assertRaises(contract.ContractError) as caught:
+            contract.hold_last_frame(mismatched, 1, 120_000_000, 120_000_000, contract.VIDEO_TAIL_POLICY)
+        self.assertIn("unknown", str(caught.exception))
+
+    def test_audio_before_picture_file_keeps_the_real_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.mp4"
+            subprocess.run([
+                "/usr/local/bin/ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=12",
+                "-f", "lavfi", "-i", "testsrc=size=160x120:rate=30:duration=12",
+                "-map", "0:a:0", "-map", "1:v:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ac", "1", "-ar", "16000", "-t", "12", str(source_path),
+            ], check=True, timeout=60)
+            probed = json.loads(subprocess.check_output([
+                "/usr/local/bin/ffprobe", "-v", "error",
+                "-show_entries", "stream=index,codec_type,codec_name,start_time,duration",
+                "-of", "json", str(source_path),
+            ], timeout=20))
+            self.assertEqual(probed["streams"][0]["codec_type"], "audio")
+            self.assertEqual(probed["streams"][1]["codec_type"], "video")
+            stat = source_path.stat()
+            source = {
+                "itemId": "11111111-1111-4111-8111-111111111111",
+                "mediaSourceId": "mediasource",
+                "libraryId": "22222222-2222-4222-8222-222222222222",
+                "contentVersion": "content-fixed", "runtimeTicks": 120_000_000,
+                "container": "mp4", "audioStreamIndex": 0,
+                "sourceItemId": "11111111-1111-4111-8111-111111111111",
+                "sourcePath": str(source_path), "sizeBytes": stat.st_size,
+                "modifiedTicks": stat.st_mtime_ns // 100 + 621355968000000000,
+            }
+            entry = {
+                "candidate_id": "joint-audio-first", "start_ticks": 0, "end_ticks": 120_000_000,
+                "full_film": True,
+            }
+            _path, state = contract.clip_window(
+                root / "cut", entry, source, contract.window_template(), probed,
+                embed.sha, embed.save, embed.read, embed.source_facts,
+            )
+            self.assertEqual(state["identity"]["video_map"], "0:1")
+            self.assertEqual(state["identity"]["audio_map"], "0:0")
+            self.assertNotIn("videoTail", state)
+            clip = root / "cut" / "clips" / "joint-audio-first.mp4"
+            for offset in (0, 3, 6, 9):
+                correct = mean_abs(gray_frame(clip, offset), gray_frame(source_path, offset))
+                shifted = mean_abs(gray_frame(clip, offset), gray_frame(source_path, offset + 0.5))
+                self.assertLess(correct, shifted)
+
 
 if __name__ == "__main__":
     unittest.main()
