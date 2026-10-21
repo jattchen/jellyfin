@@ -155,6 +155,22 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$REC
 $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
 ```
 
+画面比音轨早结束，是另一条显式规则，不能靠放宽 150 毫秒来过。配置里的 `videoTailPolicy` 必须正好是 `video-tail-hold-last-frame-200ms-v1`。没写，或写成空字符串，切片方式和以前一样。写成别的值，准备阶段就拒绝。
+
+这条规则只看最后一扇窗口。冻结探针要能证明：第 0 路是画面，配置里的那一路是音轨，音轨结尾和整片时长一致，而且画面更早结束。两者的差要大于 0、并且不超过 200 毫秒。真正切的时候再读这一路画面的帧率，把差补到整帧，补完仍不得超过 200 毫秒。满足时，用最后一帧定格填满这扇窗口，音轨整段保留，窗口起止不动，取样仍是第 0、3、6、9 秒。切完仍用原来的 12 秒正负 150 毫秒校验。
+
+差为 0 或画面更长，不补。差超过 200 毫秒，准备阶段就拒绝，并且不创建输出。中间的窗口不补。帧率读不到、时长对不上、音轨和第 0 路对不上，切到这一部时停下，不猜测帧率。别的片子如果探针超过 200 毫秒，整批准备也会拒绝。探针算不清只记下来，不因此拒绝还没切到的片子。已经成功、身份里没有这条补帧记录的切片继续复用，不重切。
+
+新目录要另写 `videoTailRecovery`。它和存储中断不能同时写。对象里要有模式版本 `video-tail-recovery-v1`、片号、那一条最后一窗的候选、残片文件哈希和快照哈希。`videoTailPolicy` 也必须是上面那条定格策略。准备阶段先核对快照，再核对每一部已成功的音画、文字和共享文档。只省略这一条从未派发的残片：没有成片、没有切片记录、没有派发状态、没有响应，而且它就是该片的最后一扇。其它残片、未完成状态、孤立响应或哈希不符，都整批拒绝，这时还没有新目录。
+
+新目录里的嵌入协议带上这条定格策略。转写协议按原字节复制，已经记下的 `recovery_origin` 仍指向更早的那棵树，也不重新做末字复核。回执写明模式、白名单、省略的残片、复用了多少条成功音画，以及模型请求数是 0、要重切的残片数是 1。它不是整批成功，也不是转写准确性验收。
+
+```bash
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery.py prepare --config "$RECOVERY_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG" --film FILM
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
+```
+
 再跑一次 `prepare` 时，新目录的字节如果和回执一致，就不再重写，也不再复核。`--film` 只进入点名的那一部。它可以重复。写了不存在的编号会拒绝。它不放宽失败即停。
 
 屏幕上的进度只显示 `F001` 这类编号、覆盖状态和数量，不显示路径、原文、向量或令牌。带路径的清单留在输出目录的私有文件里。

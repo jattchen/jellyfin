@@ -248,9 +248,14 @@ def _publish_shared_document(directory, input_hash, response_path, signature, wi
         save(shared_state, state)
 
 
-def clip(run, entry, source, window=None, probe=None):
+def clip(run, entry, source, window=None, probe=None, video_tail_policy=None):
     if window is not None:
-        return profile_module(window.get("version")).clip_window(run, entry, source, window, probe, sha, save, read, source_facts)
+        module = profile_module(window.get("version"))
+        if video_tail_policy and window.get("version") == TWELVE_SECOND_VERSION:
+            return module.clip_window(
+                run, entry, source, window, probe, sha, save, read, source_facts,
+                video_tail_policy=video_tail_policy)
+        return module.clip_window(run, entry, source, window, probe, sha, save, read, source_facts)
     path = run / 'clips' / (entry['candidate_id'] + '.mp4')
     state_path = path.with_suffix('.clip.json')
     identity = {'source': source_facts(source), 'start_ticks': entry['start_ticks'],
@@ -298,7 +303,7 @@ def multipart(signature, path):
     return body, 'multipart/form-data; boundary=' + boundary
 
 
-def prepared_entries(run, entries, source, prefetch, window=None, probe=None):
+def prepared_entries(run, entries, source, prefetch, window=None, probe=None, video_tail_policy=None):
     """Prepare at most the next CPU clip while the caller handles the current input."""
     if not prefetch or not entries:
         yield from entries
@@ -307,6 +312,8 @@ def prepared_entries(run, entries, source, prefetch, window=None, probe=None):
     def submit(pool, entry):
         if window is None:
             return pool.submit(clip, run, entry, source)
+        if video_tail_policy:
+            return pool.submit(clip, run, entry, source, window, probe, video_tail_policy)
         return pool.submit(clip, run, entry, source, window, probe)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -337,7 +344,9 @@ def dispatch(run, entry, protocol, kind):
     source_facts(protocol['source'])
     if kind == 'joint':
         window = active_ten_second(protocol)
-        path, clip_state = clip(run, entry, protocol['source'], window, protocol.get('probe_facts'))
+        path, clip_state = clip(
+            run, entry, protocol['source'], window, protocol.get('probe_facts'),
+            protocol.get('video_tail_policy'))
         input_hash, window = embedding_input(protocol, kind, entry, clip_state['sha256'])
     else:
         assert entry['text'].strip()

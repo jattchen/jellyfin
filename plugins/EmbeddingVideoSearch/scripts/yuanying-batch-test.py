@@ -1238,5 +1238,100 @@ class LanguageGapAndSelection(unittest.TestCase):
             self.assertEqual(summary["films"][0]["status"], "inflight")
 
 
+def duration_probe(audio_seconds, video_seconds, *, video_first=True):
+    video = {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.000000", "duration": video_seconds}
+    audio = {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": audio_seconds}
+    if not video_first:
+        video["index"] = 1
+        audio["index"] = 0
+    return {"streams": [video, audio]}
+
+
+class VideoTailBatch(unittest.TestCase):
+    def test_over_bound_probe_refuses_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["probe"] = duration_probe("12.000000", "11.500000")
+            config = config_for(root, [row], output)
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "video-tail")
+            self.assertFalse(output.exists())
+
+    def test_within_bound_and_unknown_are_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            within = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            within["probe"] = duration_probe("12.000000", "11.850113")
+            unknown = source_file(root / "media", "film-F002.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F002")
+            unknown["probe"] = duration_probe("12.000000", "11.900000", video_first=False)
+            config = config_for(root, [within, unknown], output)
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            summary = batch.preflight(config)
+            self.assertEqual(summary["videoTailPolicy"], contract.VIDEO_TAIL_POLICY)
+            self.assertEqual(summary["videoTailRisk"]["withinBound"], ["F001"])
+            self.assertEqual(summary["videoTailRisk"]["unknown"], ["F002"])
+            self.assertEqual(summary["videoTailRisk"]["overBound"], [])
+            protocol = batch.read_json(output / "films" / "F001" / "embed" / "protocol.json")
+            self.assertEqual(protocol["video_tail_policy"], contract.VIDEO_TAIL_POLICY)
+            asr = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
+            self.assertNotIn("video_tail_policy", asr)
+
+    def test_clip_rejection_records_the_stage_and_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["probe"] = duration_probe("12.000000", "11.850113")
+            config = config_for(root, [row], output)
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            batch.preflight(config)
+            film = output / "films" / "F001"
+            succeed_transcription(film, [])
+            batch.publish_transcription(film / "asr", film / "embed")
+
+            def send(_label, _stage, _entry):
+                raise contract.ContractError("clipped container is outside 12 seconds plus or minus 0.15")
+
+            code, summary = batch.run_batch(config, execute=lambda *_args: 0, send=send)
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertEqual(summary["stage"], "joint")
+            self.assertEqual(summary["reason"], "clip-rejected")
+            self.assertEqual(batch.read_json(output / "progress.json")["reason"], "clip-rejected")
+
+    def test_policy_does_not_resend_an_inflight_joint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["probe"] = duration_probe("12.000000", "11.850113")
+            config = config_for(root, [row], output)
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            batch.preflight(config)
+            film = output / "films" / "F001"
+            succeed_transcription(film, [])
+            batch.publish_transcription(film / "asr", film / "embed")
+            protocol = batch.read_json(film / "embed" / "protocol.json")
+            entry = protocol["joint_windows"][0]
+            batch.write_json(film / "embed" / "joint" / (entry["candidate_id"] + ".state.json"), {
+                "candidate_id": entry["candidate_id"], "status": "inflight", "input_hash": "ab" * 32,
+            })
+            sent = []
+            code, summary = batch.run_batch(
+                config,
+                execute=lambda label, stage: sent.append((label, stage)) or 0,
+                send=lambda label, stage, item: sent.append(("send", label, item["candidate_id"])),
+            )
+            self.assertEqual(sent, [])
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["stopped"], "F001")
+            self.assertEqual(summary["films"][0]["status"], "inflight")
+
+
 if __name__ == "__main__":
     unittest.main()

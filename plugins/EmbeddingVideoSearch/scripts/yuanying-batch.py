@@ -230,6 +230,9 @@ def require_config(config):
     tail_policy = config.get("alignmentTimePolicy", None)
     if tail_policy not in (None, "", ALIGNMENT_TIME_POLICY):
         raise BatchBlocked("unknown alignment time policy", reason="language-policy")
+    video_tail = config.get("videoTailPolicy", None)
+    if video_tail not in (None, "", contract.VIDEO_TAIL_POLICY):
+        raise BatchBlocked("unknown video tail policy", reason="config")
     for key in ("sourceDirectory", "sourceFacts", "outputRoot", "workerPython", "asrModel", "alignerModel"):
         if not config.get(key):
             raise BatchBlocked("config missing " + key, reason="config")
@@ -360,6 +363,8 @@ def root_protocol(config, films):
         protocol["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
     if config.get("alignmentTimePolicy") == ALIGNMENT_TIME_POLICY:
         protocol["alignmentTimePolicy"] = ALIGNMENT_TIME_POLICY
+    if config.get("videoTailPolicy") == contract.VIDEO_TAIL_POLICY:
+        protocol["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
     return protocol
 
 
@@ -386,7 +391,7 @@ def asr_protocol(record, config):
 
 def embed_protocol(record, config, output_root):
     shared = Path(config["outputRoot"]) / "shared-document-cache"
-    return {
+    protocol = {
         "version": FILM_VERSION,
         "fullFilm": True,
         "coverage": "pending",
@@ -403,6 +408,9 @@ def embed_protocol(record, config, output_root):
         "shared_document_cache": {"directory": str(shared.resolve())},
         "sampleReuse": {"policy": "explicit-equivalence-v1", "forgedInputHash": False},
     }
+    if config.get("videoTailPolicy") == contract.VIDEO_TAIL_POLICY:
+        protocol["video_tail_policy"] = contract.VIDEO_TAIL_POLICY
+    return protocol
 
 
 def write_if_absent(path, value):
@@ -1175,6 +1183,22 @@ def default_send(film_dir, stage, entry):
     embed.dispatch(Path(film_dir) / "embed", entry, protocol, stage)
 
 
+def collect_video_tail_risk(films):
+    """Read frozen probes only. A positive gap is the source video ending first."""
+    within, over, unknown = [], [], []
+    for film in films:
+        decision = contract.classify_video_tail(
+            film.get("probe"), film["source"]["audioStreamIndex"], film["source"]["runtimeTicks"])
+        status = decision["status"]
+        if status == "within-bound":
+            within.append(film["label"])
+        elif status == "over-bound":
+            over.append(film["label"])
+        elif status == "unknown":
+            unknown.append(film["label"])
+    return {"withinBound": within, "overBound": over, "unknown": unknown}
+
+
 def preflight(config, *, check_model=False):
     require_config(config)
     output = Path(config["outputRoot"])
@@ -1207,6 +1231,14 @@ def preflight(config, *, check_model=False):
     ready = not found["missingFiles"] and not found["unmatchedFacts"] and not found["drift"] and not ineligible
     if expected is not None and int(expected) != len(films):
         ready = False
+    video_tails = None
+    if config.get("videoTailPolicy") == contract.VIDEO_TAIL_POLICY:
+        video_tails = collect_video_tail_risk(films)
+        if video_tails["overBound"]:
+            raise BatchBlocked(
+                "a frozen probe video tail is longer than 200 milliseconds",
+                reason="video-tail", label=video_tails["overBound"][0],
+            )
     public_films = []
     if ready and films:
         public_films = prepare_layout(config, films)
@@ -1243,6 +1275,9 @@ def preflight(config, *, check_model=False):
         summary["unsupportedAlignLanguagePolicy"] = UNSUPPORTED_ALIGN_SKIP_POLICY
     if config.get("alignmentTimePolicy") == ALIGNMENT_TIME_POLICY:
         summary["alignmentTimePolicy"] = ALIGNMENT_TIME_POLICY
+    if video_tails is not None:
+        summary["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+        summary["videoTailRisk"] = video_tails
     if ready:
         write_json(Path(config["outputRoot"]) / "preflight.json", summary)
     return summary
@@ -1324,6 +1359,8 @@ def run_batch(config, *, execute=None, send=None, only_labels=None):
     manifest = read_json(output / "manifest.json")
     stopped = None
     stop_kind = None
+    stop_stage = None
+    stop_reason = None
     for record in selected_records(manifest, only_labels):
         film_dir = output / "films" / record["label"]
         for _step in range(12):
@@ -1333,6 +1370,8 @@ def run_batch(config, *, execute=None, send=None, only_labels=None):
                 if assessed["blocked"]:
                     stopped = record["label"]
                     stop_kind = "unknown" if unknown_stop(assessed) else "ordinary"
+                    stop_stage = assessed.get("stage")
+                    stop_reason = assessed.get("reason")
                 break
             stage = action["stage"]
             try:
@@ -1358,9 +1397,16 @@ def run_batch(config, *, execute=None, send=None, only_labels=None):
                         lambda entry, label=record["label"], kind=stage: send(label, kind, entry),
                         protocol, stage, lambda entry: joint_clip_sha(film_dir / "embed", entry),
                     )
-            except BatchBlocked as exc:
+            except contract.ContractError as exc:
                 stopped = record["label"]
-                stop_kind = "unknown" if unknown_stop(exc=exc) else "ordinary"
+                if isinstance(exc, BatchBlocked):
+                    stop_kind = "unknown" if unknown_stop(exc=exc) else "ordinary"
+                    stop_stage = exc.stage or stage
+                    stop_reason = exc.reason
+                else:
+                    stop_kind = "ordinary"
+                    stop_stage = stage
+                    stop_reason = "clip-rejected"
                 break
         if stopped:
             break
@@ -1371,6 +1417,10 @@ def run_batch(config, *, execute=None, send=None, only_labels=None):
     progress = status_summary(output)
     if stopped:
         progress["stopped"] = stopped
+        if stop_stage is not None:
+            progress["stage"] = stop_stage
+        if stop_reason is not None:
+            progress["reason"] = stop_reason
         if progress.get("coverage") == "full":
             progress["coverage"] = "pending"
         write_json(output / "progress.json", progress)

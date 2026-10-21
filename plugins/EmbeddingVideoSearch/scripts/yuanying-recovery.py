@@ -24,6 +24,10 @@ storageInterruptionRecovery is a separate explicit mode. It copies a tree
 whose alignment is already finished, checks every succeeded joint, and leaves
 out one named inflight dispatch so the normal embed entry can send it once.
 It does not invent an align failure, and it does not run a model.
+
+videoTailRecovery is another explicit mode. It checks the same succeeded
+responses, and leaves out one never-dispatched last-window partial so the new
+tree can cut that window again under video-tail-hold-last-frame-200ms-v1.
 """
 
 from __future__ import annotations
@@ -64,6 +68,14 @@ INTERRUPTION_FIELDS = (
     "candidate",
     "inputHash",
     "stateSha256",
+    "snapshotSha256",
+)
+VIDEO_TAIL_MODE = "video-tail-recovery-v1"
+VIDEO_TAIL_FIELDS = (
+    "version",
+    "film",
+    "candidate",
+    "partialSha256",
     "snapshotSha256",
 )
 
@@ -365,6 +377,12 @@ def rebind_embed(body, output, label):
     cache = copy.deepcopy(cache)
     cache["directory"] = str((Path(output) / "shared-document-cache").resolve())
     rewritten["shared_document_cache"] = cache
+    return rewritten
+
+
+def stamp_video_tail(body, output, label):
+    rewritten = rebind_embed(body, output, label)
+    rewritten["video_tail_policy"] = batch.contract.VIDEO_TAIL_POLICY
     return rewritten
 
 
@@ -792,6 +810,27 @@ def configured_interruption(config):
     return {key: value[key] for key in INTERRUPTION_FIELDS}
 
 
+def configured_video_tail(config):
+    """Return the explicit undispatched-partial whitelist, or None."""
+    value = config.get("videoTailRecovery", None)
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict) or set(value) != set(VIDEO_TAIL_FIELDS):
+        raise batch.BatchBlocked("video tail recovery authorization is incomplete", reason="config")
+    if value.get("version") != VIDEO_TAIL_MODE:
+        raise batch.BatchBlocked("unknown video tail recovery mode", reason="config")
+    film = value.get("film")
+    if not isinstance(film, str) or len(film) != 4 or not film.startswith("F") or not film[1:].isdigit():
+        raise batch.BatchBlocked("video tail film must look like F020", reason="config")
+    candidate = value.get("candidate")
+    if not isinstance(candidate, str) or candidate in ("", ".", "..") or "/" in candidate or "\\" in candidate:
+        raise batch.BatchBlocked("video tail candidate is not a file name", reason="config")
+    for key in ("partialSha256", "snapshotSha256"):
+        if not hex64(value.get(key)):
+            raise batch.BatchBlocked("video tail hash is not 64 hex characters", reason="config")
+    return {key: value[key] for key in VIDEO_TAIL_FIELDS}
+
+
 def load_stored_json(path, label=None):
     try:
         return read_json(path)
@@ -1185,6 +1224,244 @@ def plan_interruption(source, checked, output, authorization, snapshot):
     }
 
 
+def probe_tail_status(protocol):
+    source = protocol.get("source") if isinstance(protocol, dict) else None
+    if not isinstance(source, dict):
+        return {"status": "unknown"}
+    return batch.contract.classify_video_tail(
+        protocol.get("probe_facts"), source.get("audioStreamIndex"), source.get("runtimeTicks"))
+
+
+def audit_video_tail(source, checked, authorization, signature):
+    """Check every film before creating output. Only one undispatched last-window partial may be omitted."""
+    groups, _shared, _roots = film_groups(checked)
+    expected = batch.contract.signature_template(signature)
+    window = None
+    partials = []
+    referenced = set()
+    reused_joints = 0
+    reused_text = 0
+    not_started = 0
+    cached_without_dispatch = 0
+    for label, _rels in sorted(groups.items()):
+        protocol_rel = f"films/{label}/embed/protocol.json"
+        if protocol_rel not in checked:
+            raise batch.BatchBlocked("embed protocol is missing", reason="source-mismatch", label=label)
+        protocol = load_stored_json(checked[protocol_rel]["path"], label)
+        if not isinstance(protocol, dict):
+            raise batch.BatchBlocked("embed protocol is not an object", reason="source-mismatch", label=label)
+        film_window = require_window(protocol, label)
+        require_signature(protocol, expected, label)
+        window = film_window
+        if probe_tail_status(protocol)["status"] == "over-bound":
+            raise batch.BatchBlocked(
+                "a frozen probe video tail is longer than 200 milliseconds",
+                reason="video-tail", label=label,
+            )
+        windows = protocol.get("joint_windows") or []
+        if not isinstance(windows, list):
+            raise batch.BatchBlocked("joint windows are not a list", reason="source-mismatch", label=label)
+        try:
+            runtime = int(protocol["source"]["runtimeTicks"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise batch.BatchBlocked("film runtime is missing", reason="source-mismatch", label=label) from exc
+        seen = set()
+        for entry in windows:
+            if not isinstance(entry, dict):
+                raise batch.BatchBlocked("joint window is incomplete", reason="source-mismatch", label=label)
+            candidate = entry.get("candidate_id")
+            if not isinstance(candidate, str) or candidate in ("", ".", "..") or "/" in candidate or "\\" in candidate:
+                raise batch.BatchBlocked("joint candidate is not a file name", reason="source-mismatch", label=label)
+            if candidate in seen:
+                raise batch.BatchBlocked("joint candidate ids are duplicated", reason="source-mismatch", label=label)
+            seen.add(candidate)
+            state_rel = f"films/{label}/embed/joint/{candidate}.state.json"
+            response_rel = f"films/{label}/embed/joint/{candidate}.json"
+            clip_rel, meta_rel, partial_rel = clip_rels(label, candidate)
+            referenced.update(rel for rel in (state_rel, response_rel, clip_rel, meta_rel, partial_rel) if rel in checked)
+            has_state = state_rel in checked
+            has_response = response_rel in checked
+            has_clip = clip_rel in checked
+            has_meta = meta_rel in checked
+            has_partial = partial_rel in checked
+            if not has_state:
+                if has_response:
+                    raise batch.BatchBlocked("orphan joint response", reason="source-mismatch", label=label)
+                if has_partial and not has_clip and not has_meta:
+                    partials.append({
+                        "label": label,
+                        "candidate": candidate,
+                        "rel": partial_rel,
+                        "sha256": checked[partial_rel]["sha256"],
+                        "endTicks": int(entry["end_ticks"]),
+                        "runtimeTicks": runtime,
+                        "protocol": protocol,
+                    })
+                    not_started += 1
+                    continue
+                if has_partial or has_clip != has_meta:
+                    raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=label)
+                if has_clip and has_meta:
+                    same_clip_sha(checked, clip_rel, meta_rel, load_stored_json(checked[meta_rel]["path"], label).get("sha256"), label)
+                    cached_without_dispatch += 1
+                    continue
+                not_started += 1
+                continue
+            state = load_stored_json(checked[state_rel]["path"], label)
+            if not isinstance(state, dict) or state.get("candidate_id") != candidate:
+                raise batch.BatchBlocked("joint state does not match its candidate", reason="source-mismatch", label=label)
+            if state.get("status") != "succeeded":
+                raise batch.BatchBlocked(
+                    "unresolved joint is not an undispatched partial",
+                    reason="not-succeeded", label=label,
+                )
+            if has_partial:
+                raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=label)
+            if not has_response:
+                raise batch.BatchBlocked("succeeded joint is missing its response", reason="source-mismatch", label=label)
+            clip_sha = same_clip_sha(checked, clip_rel, meta_rel, (state.get("clip") or {}).get("sha256"), label)
+            if state.get("response_sha256") != checked[response_rel]["sha256"]:
+                raise batch.BatchBlocked("joint response hash does not match", reason="cache-hash-mismatch", label=label)
+            digest, checked_window = embedding_digest(protocol, "joint", entry, clip_sha, label)
+            if state.get("input_hash") != digest:
+                raise batch.BatchBlocked("joint input hash does not match", reason="cache-hash-mismatch", label=label)
+            require_embedding(
+                load_stored_json(checked[response_rel]["path"], label),
+                protocol["signature"], "joint", checked_window, label,
+            )
+            reused_joints += 1
+        reused_text += audit_text(checked, label, protocol, protocol["signature"], film_window)
+        prefix = f"films/{label}/embed/"
+        for rel in checked:
+            if not rel.startswith(prefix):
+                continue
+            name = rel[len(prefix):]
+            if name.startswith("joint/") or name.startswith("clips/"):
+                if rel not in referenced and name != "protocol.json":
+                    if rel.startswith(prefix + "joint/") or rel.startswith(prefix + "clips/"):
+                        raise batch.BatchBlocked("orphan joint file", reason="source-mismatch", label=label)
+    if window is None:
+        raise batch.BatchBlocked("recovery source has no embed protocol", reason="source-mismatch")
+    known_partials = {item["rel"] for item in partials}
+    for rel in checked:
+        if rel.endswith(".partial.mp4") and rel not in known_partials:
+            raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch")
+    if len(partials) != 1:
+        raise batch.BatchBlocked(
+            "video tail recovery requires exactly one undispatched partial",
+            reason="source-mismatch",
+        )
+    found = partials[0]
+    if found["label"] != authorization["film"] or found["candidate"] != authorization["candidate"]:
+        raise batch.BatchBlocked(
+            "authorized partial does not match the undispatched file",
+            reason="source-mismatch", label=found["label"],
+        )
+    if found["sha256"] != authorization["partialSha256"]:
+        raise batch.BatchBlocked(
+            "authorized partial hash does not match",
+            reason="source-mismatch", label=found["label"],
+        )
+    if found["endTicks"] != found["runtimeTicks"]:
+        raise batch.BatchBlocked(
+            "authorized partial is not the last window",
+            reason="source-mismatch", label=found["label"],
+        )
+    if probe_tail_status(found["protocol"])["status"] != "within-bound":
+        raise batch.BatchBlocked(
+            "authorized partial is not a proven video tail within 200 milliseconds",
+            reason="video-tail", label=found["label"],
+        )
+    reused_shared = audit_shared_documents(checked, expected, window)
+    evidence = {
+        "film": found["label"],
+        "candidate": found["candidate"],
+        "status": "undispatched-partial",
+        "partialSha256": authorization["partialSha256"],
+        "responsePresent": False,
+        "dispatchPresent": False,
+        "sourceRelativePath": found["rel"],
+    }
+    return {
+        "reusedSucceededJoints": reused_joints,
+        "reusedSucceededText": reused_text,
+        "reusedSharedDocuments": reused_shared,
+        "notStartedJoints": not_started,
+        "cachedClipsWithoutDispatch": cached_without_dispatch,
+        "omit": [found["rel"]],
+        "omittedIncompleteClips": [{
+            "path": found["rel"],
+            "reason": "undispatched-partial",
+            "successRecord": False,
+        }],
+        "unknownEvidence": evidence,
+    }
+
+
+def plan_video_tail(source, checked, output, authorization, snapshot):
+    """Copy a finished alignment tree. Omit only the one never-dispatched last-window partial."""
+    groups, _shared, roots = film_groups(checked)
+    if "manifest.json" not in roots:
+        raise batch.BatchBlocked("snapshot has no manifest", reason="source-mismatch")
+    unexpected = [name for name in roots if name not in SKIPPED_ROOT_FILES and name != "manifest.json"]
+    if unexpected:
+        raise batch.BatchBlocked("unexpected recovery source file", reason="source-mismatch")
+    films = [classify_film(label, rels, source, checked) for label, rels in sorted(groups.items())]
+    for film in films:
+        if film["kind"] not in ("settled", "pending"):
+            raise batch.BatchBlocked(
+                "video tail recovery does not accept an unresolved transcription failure",
+                reason="transcription-failed", label=film["label"],
+            )
+    audit = audit_video_tail(source, checked, authorization, batch.EXPECTED_PROCESSING_ID)
+    omit = set(audit["omit"])
+    copies = []
+    rewrites = []
+    for rel in sorted(checked):
+        if rel in SKIPPED_ROOT_FILES or rel in omit:
+            continue
+        if rel == "manifest.json":
+            copies.append({"path": rel, "action": "copied", "source": rel})
+            continue
+        film_label_value = Path(rel).parts[1] if rel.startswith("films/") else None
+        if rel.endswith("/asr/chunks.json") and film_label_value is not None:
+            rewritten, changed = rebind_chunks(read_json(source / rel), output, checked, film_label_value)
+            if changed:
+                rewrites.append({
+                    "path": rel, "action": "rebound", "source": rel, "data": json_bytes(rewritten),
+                })
+                continue
+        if rel.endswith("/embed/protocol.json") and film_label_value is not None:
+            rewrites.append({
+                "path": rel,
+                "action": "rebound",
+                "source": rel,
+                "data": json_bytes(stamp_video_tail(read_json(source / rel), output, film_label_value)),
+            })
+            continue
+        copies.append({"path": rel, "action": "copied", "source": rel})
+    omitted = sorted(name for name in roots if name in SKIPPED_ROOT_FILES)
+    return {
+        "copies": copies,
+        "rewrites": rewrites,
+        "derived": None,
+        "tail": None,
+        "derivedTails": [],
+        "omittedSourceFiles": omitted,
+        "videoTail": {
+            "authorization": {key: authorization[key] for key in VIDEO_TAIL_FIELDS},
+            "unknownEvidence": audit["unknownEvidence"],
+            "omittedIncompleteClips": audit["omittedIncompleteClips"],
+            "reusedSucceededJoints": audit["reusedSucceededJoints"],
+            "reusedSucceededText": audit["reusedSucceededText"],
+            "reusedSharedDocuments": audit["reusedSharedDocuments"],
+            "notStartedJoints": audit["notStartedJoints"],
+            "cachedClipsWithoutDispatch": audit["cachedClipsWithoutDispatch"],
+            "snapshotTotalBytes": int(snapshot["totalBytes"]),
+        },
+    }
+
+
 def receipt_body(config, snapshot_path, snapshot, plan, written):
     derived = plan.get("derived")
     skips = []
@@ -1236,22 +1513,43 @@ def receipt_body(config, snapshot_path, snapshot, plan, written):
         body["authorizedResends"] = 1
         body["transcriptionAccuracyVerified"] = False
         body["batchExitAccepted"] = False
+    video_tail = plan.get("videoTail")
+    if video_tail is not None:
+        body["mode"] = VIDEO_TAIL_MODE
+        body["authorization"] = video_tail["authorization"]
+        body["unknownEvidence"] = video_tail["unknownEvidence"]
+        body["omittedIncompleteClips"] = video_tail["omittedIncompleteClips"]
+        body["reusedSucceededJoints"] = video_tail["reusedSucceededJoints"]
+        body["reusedSucceededText"] = video_tail["reusedSucceededText"]
+        body["reusedSharedDocuments"] = video_tail["reusedSharedDocuments"]
+        body["notStartedJoints"] = video_tail["notStartedJoints"]
+        body["cachedClipsWithoutDispatch"] = video_tail["cachedClipsWithoutDispatch"]
+        body["snapshotTotalBytes"] = video_tail["snapshotTotalBytes"]
+        body["copyCount"] = len(plan["copies"])
+        body["rebindCount"] = len(plan["rewrites"])
+        body["modelRequests"] = 0
+        body["rebuiltPartial"] = 1
+        body["videoTailPolicy"] = batch.contract.VIDEO_TAIL_POLICY
+        body["transcriptionAccuracyVerified"] = False
+        body["batchExitAccepted"] = False
     return body
 
 
-def confirm_idempotent(output, checked, tail_policy=None, interruption=None):
+def confirm_idempotent(output, checked, tail_policy=None, interruption=None, video_tail=None):
     receipt_path = Path(output) / RECEIPT_NAME
     if not receipt_path.is_file():
         raise batch.BatchBlocked("recovery output exists without a receipt", reason="output-exists")
     receipt = read_json(receipt_path)
     if receipt.get("version") != RECEIPT_VERSION or receipt.get("policy") != POLICY or receipt.get("hardlink") is not False:
         raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
-    if interruption is None:
+    if interruption is not None and video_tail is not None:
+        raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+    if interruption is None and video_tail is None:
         if receipt.get("mode"):
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
         if (receipt.get("alignmentTimePolicy") or None) != (tail_policy or None):
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
-    else:
+    elif interruption is not None:
         if receipt.get("mode") != INTERRUPTION_MODE or receipt.get("authorization") != interruption:
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
         if receipt.get("modelRequests") != 0 or receipt.get("authorizedResends") != 1:
@@ -1259,6 +1557,24 @@ def confirm_idempotent(output, checked, tail_policy=None, interruption=None):
         if receipt.get("batchExitAccepted") is not False or receipt.get("transcriptionAccuracyVerified") is not False:
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
         if receipt.get("snapshotSha256") != interruption["snapshotSha256"]:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+    else:
+        evidence = receipt.get("unknownEvidence") or {}
+        if receipt.get("mode") != VIDEO_TAIL_MODE or receipt.get("authorization") != video_tail:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("modelRequests") != 0 or receipt.get("rebuiltPartial") != 1 or "authorizedResends" in receipt:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("videoTailPolicy") != batch.contract.VIDEO_TAIL_POLICY:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("batchExitAccepted") is not False or receipt.get("transcriptionAccuracyVerified") is not False:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("snapshotSha256") != video_tail["snapshotSha256"]:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if (
+            evidence.get("status") != "undispatched-partial"
+            or evidence.get("responsePresent") is not False
+            or evidence.get("dispatchPresent") is not False
+        ):
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
     expected = {item["path"]: item for item in receipt.get("files") or []}
     present = listed_files(output)
@@ -1287,6 +1603,11 @@ def prepare(config):
         raise batch.BatchBlocked("recovery requires the explicit skip policy", reason="language-policy")
     tail_name = configured_tail(config)
     interruption = configured_interruption(config)
+    video_tail = configured_video_tail(config)
+    if interruption is not None and video_tail is not None:
+        raise batch.BatchBlocked("recovery accepts only one explicit mode", reason="config")
+    if video_tail is not None and config.get("videoTailPolicy") != batch.contract.VIDEO_TAIL_POLICY:
+        raise batch.BatchBlocked("video tail recovery requires the hold-last-frame policy", reason="config")
     for key in ("recoverySource", "recoverySnapshot"):
         if not config.get(key):
             raise batch.BatchBlocked("config missing " + key, reason="config")
@@ -1303,14 +1624,21 @@ def prepare(config):
             "snapshot hash does not match the interruption authorization",
             reason="source-mismatch",
         )
+    if video_tail is not None and file_sha256(snapshot_path) != video_tail["snapshotSha256"]:
+        raise batch.BatchBlocked(
+            "snapshot hash does not match the video tail authorization",
+            reason="source-mismatch",
+        )
     if output.exists():
         if not output.is_dir():
             raise batch.BatchBlocked("recovery output exists", reason="output-exists")
-        receipt = confirm_idempotent(output, checked, tail_name, interruption)
+        receipt = confirm_idempotent(output, checked, tail_name, interruption, video_tail)
         source_unchanged(checked)
         return receipt
     if interruption is not None:
         plan = plan_interruption(source, checked, output, interruption, snapshot)
+    elif video_tail is not None:
+        plan = plan_video_tail(source, checked, output, video_tail, snapshot)
     else:
         plan = plan_recovery(source, checked, output, tail_policy=tail_name is not None)
     output.mkdir(mode=0o700)
@@ -1331,7 +1659,7 @@ def prepare(config):
 
 def main(argv=None):
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description="把已完成的批次按字节复制到新目录。可派生一处语言缺口，离线复核一处不超过 80 毫秒的末字越界，或按显式白名单省略一处存储中断的音画请求。不推理。")
+    parser = argparse.ArgumentParser(description="把已完成的批次按字节复制到新目录。可派生一处语言缺口，离线复核一处不超过 80 毫秒的末字越界，按显式白名单省略一处存储中断的音画请求，或省略一处从未派发的片尾残片以便定格重切。不推理。")
     parser.add_argument("command", choices=("prepare",))
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -1359,6 +1687,16 @@ def main(argv=None):
         summary["reusedSucceededJoints"] = receipt["reusedSucceededJoints"]
         summary["modelRequests"] = receipt["modelRequests"]
         summary["authorizedResends"] = receipt["authorizedResends"]
+        summary["batchExitAccepted"] = receipt["batchExitAccepted"]
+        summary["transcriptionAccuracyVerified"] = receipt["transcriptionAccuracyVerified"]
+    if receipt.get("mode") == VIDEO_TAIL_MODE:
+        summary["mode"] = receipt["mode"]
+        summary["film"] = receipt["authorization"]["film"]
+        summary["candidate"] = receipt["authorization"]["candidate"]
+        summary["reusedSucceededJoints"] = receipt["reusedSucceededJoints"]
+        summary["modelRequests"] = receipt["modelRequests"]
+        summary["rebuiltPartial"] = receipt["rebuiltPartial"]
+        summary["videoTailPolicy"] = receipt["videoTailPolicy"]
         summary["batchExitAccepted"] = receipt["batchExitAccepted"]
         summary["transcriptionAccuracyVerified"] = receipt["transcriptionAccuracyVerified"]
     print(json.dumps(summary, ensure_ascii=False, indent=2))

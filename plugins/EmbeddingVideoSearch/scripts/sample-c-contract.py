@@ -8,6 +8,7 @@ back with provenance.absoluteOffsetTicks. This script does not embed,
 transcribe, or call a model.
 """
 import argparse
+from decimal import Decimal, ROUND_CEILING, ROUND_UP
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ LENGTH_TICKS = 120_000_000
 STEP_TICKS = 100_000_000
 SAMPLE_TICKS = 1_200_000_000
 SAMPLED_SECONDS = [0, 3, 6, 9]
+VIDEO_TAIL_POLICY = "video-tail-hold-last-frame-200ms-v1"
+VIDEO_TAIL_LIMIT = Decimal("0.200")
 MAX_SOFT_TOKENS = 70
 MODEL_ID = "google/embeddinggemma-2"
 REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
@@ -585,16 +588,146 @@ def offset_transcription(source_run, dest_run):
             "absoluteOffsetTicks": offset, "asrUnchanged": True}
 
 
-def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe):
+def _stream_duration(stream):
+    if not isinstance(stream, dict):
+        return None
+    raw = stream.get("duration")
+    if raw in (None, "", "N/A"):
+        return None
+    try:
+        return Decimal(str(raw))
+    except Exception:
+        return None
+
+
+def _frame_duration(rate):
+    if not isinstance(rate, str) or "/" not in rate:
+        return None
+    numerator, denominator = rate.split("/", 1)
+    try:
+        top, bottom = Decimal(numerator), Decimal(denominator)
+    except Exception:
+        return None
+    if top <= 0 or bottom <= 0:
+        return None
+    return bottom / top
+
+
+def _seconds_text(value):
+    return format(value, "f")
+
+
+def classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=None):
+    """Classify a frozen source end. This does not open the media."""
+    streams = list((probe or {}).get("streams") or [])
+    video = next((stream for stream in streams if stream.get("index") == 0 and stream.get("codec_type") == "video"), None)
+    try:
+        audio_index = int(audio_stream_index)
+    except (TypeError, ValueError):
+        audio_index = None
+    audio = None if audio_index is None else next((stream for stream in streams if stream.get("index") == audio_index), None)
+    video_end = _stream_duration(video)
+    audio_end = _stream_duration(audio)
+    if video is None or audio is None or audio.get("codec_type") != "audio" or video_end is None or audio_end is None:
+        return {"status": "unknown"}
+    runtime = Decimal(int(runtime_ticks)) / Decimal(10_000_000)
+    if abs(audio_end - runtime) > Decimal("0.001"):
+        return {"status": "unknown"}
+    gap = audio_end - video_end
+    record = {
+        "gapSeconds": _seconds_text(gap),
+        "videoEndSeconds": _seconds_text(video_end),
+        "audioEndSeconds": _seconds_text(audio_end),
+    }
+    if gap <= 0:
+        return {"status": "none", **record}
+    if gap > VIDEO_TAIL_LIMIT:
+        return {"status": "over-bound", **record}
+    record["status"] = "within-bound"
+    if frame_rate is None:
+        return record
+    frame = _frame_duration(frame_rate)
+    if frame is None or frame <= 0 or frame > VIDEO_TAIL_LIMIT:
+        return {"status": "unknown", **record}
+    frames = (gap / frame).to_integral_value(rounding=ROUND_CEILING)
+    if frames <= 0:
+        frames = Decimal(1)
+    extension = frames * frame
+    quantum = Decimal("0.000001")
+    extension = (extension / quantum).to_integral_value(rounding=ROUND_UP) * quantum
+    if extension > VIDEO_TAIL_LIMIT:
+        return {"status": "over-bound", **record, "extensionSeconds": _seconds_text(extension)}
+    record["frameRate"] = frame_rate
+    record["extensionSeconds"] = _seconds_text(extension)
+    return record
+
+
+def hold_last_frame(probe, audio_stream_index, runtime_ticks, end_ticks, policy, frame_rate=None):
+    """Return the last-window hold, or None when this window must be cut unchanged."""
+    if policy in (None, ""):
+        return None
+    if policy != VIDEO_TAIL_POLICY:
+        raise ContractError("unknown video tail policy")
+    if int(end_ticks) != int(runtime_ticks):
+        return None
+    decision = classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=frame_rate)
+    status = decision["status"]
+    if status == "none":
+        return None
+    if status == "over-bound":
+        raise ContractError("video tail is longer than 200 milliseconds")
+    if status != "within-bound":
+        raise ContractError("video tail source duration is unknown")
+    if frame_rate is None:
+        decision["needsFrameRate"] = True
+        return decision
+    if "extensionSeconds" not in decision:
+        raise ContractError("video tail source duration is unknown")
+    return decision
+
+
+def probe_frame_rate(source_path):
+    completed = subprocess.run(
+        ["/usr/local/bin/ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate", "-of", "json", str(source_path)],
+        check=False, capture_output=True, timeout=20,
+    )
+    if completed.returncode != 0:
+        raise ContractError("video tail frame rate is unknown")
+    try:
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContractError("video tail frame rate is unknown") from exc
+    streams = document.get("streams") or []
+    rate = streams[0].get("r_frame_rate") if streams else None
+    if _frame_duration(rate) is None:
+        raise ContractError("video tail frame rate is unknown")
+    return rate
+
+
+def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe, video_tail_extension=None):
     facts = check_source_probe(probe, audio_stream_index)
     start = ticks_to_seconds(int(start_ticks))
     arguments = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-accurate_seek",
-        "-ss", start, "-i", str(source), "-t", "12",
-        "-map", "0:v:0", "-map", facts["audio_map"],
+        "-ss", start, "-i", str(source),
+    ]
+    if video_tail_extension:
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", str(video_tail_extension)):
+            raise ContractError("video tail extension is not a duration")
+        arguments.extend([
+            "-filter_complex",
+            "[0:v:0]tpad=stop_mode=clone:stop_duration=" + str(video_tail_extension) + "[v]",
+            "-map", "[v]",
+        ])
+    arguments.extend(["-t", "12"])
+    if not video_tail_extension:
+        arguments.extend(["-map", "0:v:0"])
+    arguments.extend([
+        "-map", facts["audio_map"],
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
         "-threads", "2", "-c:a", "aac", "-ac", "1", "-ar", "16000", "-sn", "-dn", str(output),
-    ]
+    ])
     raw_start = facts["video_start_time_raw"]
     if raw_start and raw_start not in {"0", "0.000000", "0.0"} and raw_start in arguments:
         raise ContractError("video start was added to the clip time")
@@ -609,7 +742,27 @@ def entry_full_film(entry):
     return bool(isinstance(entry, dict) and entry.get("full_film") is True)
 
 
-def clip_window(run, entry, source, window, probe, sha, save, read, source_facts):
+def decide_video_tail_hold(source, probe, end, policy):
+    preliminary = hold_last_frame(
+        probe, source["audioStreamIndex"], source["runtimeTicks"], end, policy)
+    if not preliminary or not preliminary.get("needsFrameRate"):
+        return preliminary
+    rate = probe_frame_rate(source["sourcePath"])
+    return hold_last_frame(
+        probe, source["audioStreamIndex"], source["runtimeTicks"], end, policy, frame_rate=rate)
+
+
+def identity_with_hold(identity, hold):
+    if not hold:
+        return identity
+    extended = dict(identity)
+    extended["video_tail_policy"] = VIDEO_TAIL_POLICY
+    extended["video_tail_hold"] = "last-frame"
+    extended["video_tail_extension_seconds"] = hold["extensionSeconds"]
+    return extended
+
+
+def clip_window(run, entry, source, window, probe, sha, save, read, source_facts, video_tail_policy=None):
     checked_window(window)
     facts = check_source_probe(probe, source["audioStreamIndex"])
     start, end = int(entry["start_ticks"]), int(entry["end_ticks"])
@@ -629,16 +782,25 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
     }
     if state_path.exists():
         state = read(state_path)
-        if state.get("identity") != identity or sha(path) != state.get("sha256"):
-            raise ContractError("Cached clip changed")
-        return path, state
+        stored = state.get("identity")
+        digest_ok = sha(path) == state.get("sha256")
+        if stored == identity and digest_ok:
+            return path, state
+        extended = identity_with_hold(identity, decide_video_tail_hold(source, probe, end, video_tail_policy))
+        if stored == extended and digest_ok:
+            return path, state
+        raise ContractError("Cached clip changed")
+    hold = decide_video_tail_hold(source, probe, end, video_tail_policy)
+    identity = identity_with_hold(identity, hold)
     if path.exists():
         raise ContractError("Unverified clip already exists")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(path.stem + ".partial.mp4")
     if temporary.exists():
         raise ContractError("Interrupted clip needs inspection")
-    arguments, _ = clip_ffmpeg_arguments(source["sourcePath"], start, source["audioStreamIndex"], temporary, probe)
+    extension = None if not hold else hold["extensionSeconds"]
+    arguments, _ = clip_ffmpeg_arguments(
+        source["sourcePath"], start, source["audioStreamIndex"], temporary, probe, extension)
     arguments[0] = "/usr/local/bin/ffmpeg"
     started = time.monotonic()
     subprocess.run(arguments, check=True, timeout=180)
@@ -656,6 +818,16 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
     temporary.rename(path)
     state = {"identity": identity, "sha256": sha(path), "probe": probe_out,
              "clip_seconds": time.monotonic() - started, "bytes": path.stat().st_size}
+    if hold:
+        state["videoTail"] = {
+            "policy": VIDEO_TAIL_POLICY,
+            "hold": "last-frame",
+            "gapSeconds": hold["gapSeconds"],
+            "extensionSeconds": hold["extensionSeconds"],
+            "frameRate": hold["frameRate"],
+            "videoEndSeconds": hold["videoEndSeconds"],
+            "audioEndSeconds": hold["audioEndSeconds"],
+        }
     save(state_path, state)
     return path, state
 
@@ -700,7 +872,8 @@ def run_embedding(embed, args, run, protocol):
     completed = new_jobs = 0
     try:
         with embed.closing(embed.prepared_entries(
-                run, entries, source, args.prefetch_clips, window, protocol.get("probe_facts"))) as jobs:
+                run, entries, source, args.prefetch_clips, window, protocol.get("probe_facts"),
+                protocol.get("video_tail_policy"))) as jobs:
             while args.max_new_jobs is None or new_jobs < args.max_new_jobs:
                 entry = next(jobs, None)
                 if entry is None:
