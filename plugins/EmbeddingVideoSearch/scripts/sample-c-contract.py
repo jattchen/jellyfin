@@ -621,16 +621,27 @@ def offset_transcription(source_run, dest_run):
             "absoluteOffsetTicks": offset, "asrUnchanged": True}
 
 
-def _stream_duration(stream):
-    if not isinstance(stream, dict):
-        return None
-    raw = stream.get("duration")
-    if raw in (None, "", "N/A"):
+def _finite_seconds(raw):
+    if isinstance(raw, bool) or raw in (None, "", "N/A"):
         return None
     try:
-        return Decimal(str(raw))
+        value = Decimal(str(raw))
     except Exception:
         return None
+    if not value.is_finite():
+        return None
+    return value
+
+
+def _stream_endpoint(stream):
+    """Container-timeline end: start plus duration. Illegal timestamps stay unknown."""
+    if not isinstance(stream, dict):
+        return None
+    start = _finite_seconds(stream.get("start_time"))
+    duration = _finite_seconds(stream.get("duration"))
+    if start is None or duration is None or start < 0 or duration < 0:
+        return None
+    return start + duration
 
 
 def _frame_duration(rate):
@@ -662,8 +673,8 @@ def classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=Non
     except (TypeError, ValueError):
         audio_index = None
     audio = None if audio_index is None else next((stream for stream in streams if stream.get("index") == audio_index), None)
-    video_end = _stream_duration(video)
-    audio_end = _stream_duration(audio)
+    video_end = _stream_endpoint(video)
+    audio_end = _stream_endpoint(audio)
     if audio is None or audio.get("codec_type") != "audio" or video_end is None or audio_end is None:
         return {"status": "unknown"}
     runtime = Decimal(int(runtime_ticks)) / Decimal(10_000_000)
@@ -673,8 +684,8 @@ def classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=Non
         "videoEndSeconds": _seconds_text(video_end),
         "audioEndSeconds": _seconds_text(audio_end),
     }
-    # The container took the longer picture. That is not a picture pad.
-    if gap < 0 and abs(video_end - runtime) <= Decimal("0.001"):
+    # The picture already reaches the container. Seek stays on the window, with no hold.
+    if video_end >= runtime or (video_end + Decimal("0.001") >= runtime and gap <= 0):
         return {"status": "none", **record}
     if abs(audio_end - runtime) > Decimal("0.001"):
         return {"status": "unknown"}

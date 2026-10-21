@@ -1296,6 +1296,24 @@ class VideoTailBatch(unittest.TestCase):
             asr = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
             self.assertNotIn("video_tail_policy", asr)
 
+    def test_picture_that_reaches_runtime_is_not_an_unknown_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            runtime = 4_253_432_220
+            row = source_file(root / "media", "film-F024.mp4", str(uuid.uuid4()), runtime, label="F024")
+            row["probe"] = {"streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.023222", "duration": "425.320000"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "425.296689"},
+            ]}
+            config = config_for(root, [row], output)
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            summary = batch.preflight(config)
+            self.assertEqual(summary["videoTailRisk"]["unknown"], [])
+            self.assertEqual(summary["videoTailRisk"]["withinBound"], [])
+            self.assertEqual(summary["videoTailRisk"]["overBound"], [])
+            self.assertTrue(output.is_dir())
+
     def test_known_bad_picture_map_refuses_before_output(self):
         cases = [
             {"streams": [

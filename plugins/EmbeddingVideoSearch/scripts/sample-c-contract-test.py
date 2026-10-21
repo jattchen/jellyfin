@@ -343,6 +343,78 @@ class VideoTailHold(unittest.TestCase):
             contract.hold_last_frame(mismatched, 1, 120_000_000, 120_000_000, contract.VIDEO_TAIL_POLICY)
         self.assertIn("unknown", str(caught.exception))
 
+    def test_nonzero_start_uses_the_container_endpoint_without_shifting_seek(self):
+        reached = {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.023222", "duration": "425.320000"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "425.296689"},
+        ]}
+        runtime = 4_253_432_220
+        decision = contract.classify_video_tail(reached, 1, runtime)
+        self.assertEqual(decision["status"], "none")
+        self.assertEqual(decision["videoEndSeconds"], "425.343222")
+        self.assertEqual(decision["audioEndSeconds"], "425.296689")
+        later = {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.040000", "duration": "887.600000"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "887.582766"},
+        ]}
+        later_decision = contract.classify_video_tail(later, 1, 8_876_400_000)
+        self.assertEqual(later_decision["status"], "none")
+        self.assertEqual(later_decision["videoEndSeconds"], "887.640000")
+        source = {"audioStreamIndex": 1, "runtimeTicks": runtime, "sourcePath": "/media/film.mp4"}
+        calls = []
+        original = contract.probe_frame_rate
+        contract.probe_frame_rate = lambda *_args: calls.append("probe") or "30/1"
+        try:
+            self.assertIsNone(contract.decide_video_tail_hold(
+                source, reached, runtime, contract.VIDEO_TAIL_POLICY))
+        finally:
+            contract.probe_frame_rate = original
+        self.assertEqual(calls, [])
+        start = runtime - contract.LENGTH_TICKS
+        arguments, _facts = contract.clip_ffmpeg_arguments("/media/film.mp4", start, 1, "/tmp/out.mp4", reached)
+        self.assertEqual(arguments[arguments.index("-ss") + 1], contract.ticks_to_seconds(start))
+        self.assertNotIn("0.023222", arguments)
+        self.assertIn("0:v:0", arguments)
+        short = {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.023222", "duration": "11.826778"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "12.000000"},
+        ]}
+        short_decision = contract.classify_video_tail(short, 1, 120_000_000, frame_rate="30/1")
+        self.assertEqual(short_decision["status"], "within-bound")
+        self.assertEqual(short_decision["gapSeconds"], "0.150000")
+        self.assertEqual(short_decision["videoEndSeconds"], "11.850000")
+        self.assertEqual(short_decision["extensionSeconds"], "0.166667")
+        held, _facts = contract.clip_ffmpeg_arguments("/media/film.mp4", 0, 1, "/tmp/out.mp4", short, "0.166667")
+        self.assertEqual(held[held.index("-ss") + 1], "0")
+        self.assertNotIn("0.023222", held)
+        self.assertIn("[0:v:0]tpad=stop_mode=clone:stop_duration=0.166667[v]", held)
+
+    def test_missing_or_illegal_timestamps_stay_unknown(self):
+        def probe(start, duration):
+            video = {"index": 0, "codec_type": "video", "codec_name": "h264", "duration": duration}
+            if start is not None:
+                video["start_time"] = start
+            return {"streams": [
+                video,
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000", "duration": "12.000000"},
+            ]}
+        for start, duration in (
+            (None, "11.900000"),
+            ("", "11.900000"),
+            ("N/A", "11.900000"),
+            ("nan", "11.900000"),
+            ("inf", "11.900000"),
+            ("-0.010000", "11.900000"),
+            ("0.000000", None),
+            ("0.000000", "-1.000000"),
+            ("0.000000", "nan"),
+        ):
+            decision = contract.classify_video_tail(probe(start, duration), 1, 120_000_000)
+            self.assertEqual(decision["status"], "unknown", msg=repr((start, duration)))
+        with self.assertRaises(contract.ContractError) as caught:
+            contract.hold_last_frame(probe(None, "11.900000"), 1, 120_000_000, 120_000_000, contract.VIDEO_TAIL_POLICY)
+        self.assertIn("unknown", str(caught.exception))
+
     def test_audio_before_picture_file_keeps_the_real_frames(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
