@@ -272,7 +272,7 @@ public sealed partial class SearchRuntime : IDisposable
 
         if (candidates.Representations.Length > 0)
         {
-            return SearchCandidates(userId, request, embedded.Vector, candidates, snapshot, limit, response);
+            return SearchCandidates(userId, request, embedded.Vector, candidates, snapshot, limit, response, cancellationToken);
         }
 
         var rows = _store.LoadSearchable(libraries, snapshot.Generation);

@@ -537,6 +537,325 @@ public class SimilarSegmentTests
         Assert.Equal(0, catalog.Calls);
     }
 
+    [Fact]
+    public async Task Real_scale_search_reads_each_source_once_per_pass()
+    {
+        // The old search walked every joint and text window twice: (8179 + 3293) * 2 checks,
+        // then read media state for every positive hit. Counts below must follow the 46 sources.
+        const int jointCount = 8179;
+        const int textCount = 3293;
+        const int sourceCount = 46;
+        using var catalog = Catalog.Create();
+        var shared = Axis(0);
+        var films = Enumerable.Range(0, sourceCount).Select(_ => Guid.NewGuid()).ToArray();
+        var joint = new List<CandidateRow>(jointCount);
+        var text = new List<CandidateRow>(textCount);
+        var jointOrdinal = new int[sourceCount];
+        var textOrdinal = new int[sourceCount];
+        for (var index = 0; index < jointCount; index++)
+        {
+            var sourceIndex = index % sourceCount;
+            var start = jointOrdinal[sourceIndex]++ * 121L;
+            joint.Add(Window(films[sourceIndex], "film", catalog.LibraryId, "v1", start, shared));
+        }
+
+        for (var index = 0; index < textCount; index++)
+        {
+            var sourceIndex = index % sourceCount;
+            var start = 1_000_000 + (textOrdinal[sourceIndex]++ * 121L);
+            text.Add(Window(films[sourceIndex], "film", catalog.LibraryId, "v1", start, shared, "text"));
+        }
+
+        foreach (var film in films)
+        {
+            catalog.Persist(film, "film", catalog.LibraryId, "v1");
+        }
+
+        catalog.Adopt(joint, text);
+        catalog.Save();
+        var facts = new Dictionary<Guid, int>();
+        catalog.Fixture.OnReadFacts = (item, _) => facts[item] = facts.GetValueOrDefault(item) + 1;
+        var store = catalog.Fixture.Store;
+        var versions = store.StoredContentVersionReads;
+        var states = store.MediaStateReads;
+        var snapshots = store.CandidateSnapshotReads;
+        var access = catalog.Fixture.AccessChecks;
+        var plain = new SearchRequest { GroupByVideo = true, Limit = 3, CollapseRuns = true };
+        var response = await catalog.Search("scale-search", plain, TestContext.Current.CancellationToken);
+
+        Assert.Equal("referenceTailR", response.QualityPolicy.ScoreMeaning);
+        Assert.Equal(1, catalog.Calls);
+        Assert.Equal(15, response.Results.Count);
+        Assert.Equal(15, response.Results.Sum(hit => hit.Run!.MemberCount));
+        Assert.Null(response.RawResults);
+        Assert.All(response.Results, hit =>
+        {
+            Assert.NotNull(hit.Run);
+            Assert.Equal("candidate", hit.Quality);
+            Assert.True(hit.IndexComplete);
+            Assert.True(hit.Score >= 0);
+        });
+        Assert.Equal(sourceCount, facts.Count);
+        Assert.All(facts.Values, count => Assert.Equal(2, count));
+        Assert.Equal(sourceCount * 4, store.StoredContentVersionReads - versions);
+        Assert.Equal(3, store.MediaStateReads - states);
+        Assert.Equal(3, store.CandidateSnapshotReads - snapshots);
+        Assert.Equal(sourceCount * 2, catalog.Fixture.AccessChecks - access);
+
+        states = store.MediaStateReads;
+        var diagnosed = await catalog.Search("scale-diag", new SearchRequest
+        {
+            GroupByVideo = true, Limit = 3, CollapseRuns = true, Diagnostics = true
+        }, TestContext.Current.CancellationToken);
+        var raw = diagnosed.RawResults;
+        Assert.NotNull(raw);
+        Assert.Equal(jointCount + textCount, raw.Count);
+        Assert.All(raw, hit => Assert.Null(hit.Run));
+        Assert.All(raw, hit => Assert.True(hit.IndexComplete));
+        Assert.All(diagnosed.Results, hit => Assert.True(hit.IndexComplete));
+        Assert.Equal(sourceCount, store.MediaStateReads - states);
+        Assert.True(store.MediaStateReads - states < raw.Count);
+
+        var firstItems = response.Results.Select(hit => hit.ItemId).ToHashSet();
+        var victim = response.Results.Select(hit => hit.ItemId).First(item => item != response.Results[0].ItemId);
+        catalog.Fixture.Allow.Remove(victim);
+        facts.Clear();
+        versions = store.StoredContentVersionReads;
+        states = store.MediaStateReads;
+        snapshots = store.CandidateSnapshotReads;
+        access = catalog.Fixture.AccessChecks;
+        var again = await catalog.Search("scale-search-again", plain, TestContext.Current.CancellationToken);
+        Assert.Equal(15, again.Results.Count);
+        Assert.Equal(15, again.Results.Sum(hit => hit.Run!.MemberCount));
+        Assert.DoesNotContain(again.Results, hit => hit.ItemId == victim);
+        Assert.Contains(again.Results, hit => !firstItems.Contains(hit.ItemId));
+        Assert.Equal(sourceCount - 1, facts.Count);
+        Assert.DoesNotContain(victim, facts.Keys);
+        Assert.All(facts.Values, count => Assert.Equal(2, count));
+        Assert.Equal((sourceCount - 1) * 4, store.StoredContentVersionReads - versions);
+        Assert.Equal(3, store.MediaStateReads - states);
+        Assert.Equal(3, store.CandidateSnapshotReads - snapshots);
+        Assert.Equal(sourceCount * 2, catalog.Fixture.AccessChecks - access);
+        Assert.Equal("referenceTailR", again.QualityPolicy.ScoreMeaning);
+        Assert.Equal(3, catalog.Calls);
+    }
+
+    [Fact]
+    public async Task Search_distinct_source_version_and_library_do_not_share_a_verdict()
+    {
+        using var catalog = Catalog.Create();
+        var vector = Axis(0);
+        var library = catalog.LibraryId;
+        var otherLibrary = Guid.NewGuid();
+        var opened = Guid.NewGuid();
+        var versioned = Guid.NewGuid();
+        var splitSource = Guid.NewGuid();
+        var splitLibrary = Guid.NewGuid();
+        var first = Window(opened, "film", library, "v1", 0, vector);
+        var staleVersion = Window(versioned, "film", library, "v2", 1000, vector);
+        var currentVersion = Window(versioned, "film", library, "v1", 2000, vector);
+        var hiddenSource = Window(splitSource, "extra", library, "v1", 3000, vector);
+        var keptSource = Window(splitSource, "film", library, "v1", 4000, vector);
+        var outsideLibrary = Window(splitLibrary, "film", otherLibrary, "v1", 5000, vector);
+        var insideLibrary = Window(splitLibrary, "film", library, "v1", 6000, vector);
+        catalog.Persist(opened, "film", library, "v1");
+        catalog.Persist(versioned, "film", library, "v1");
+        catalog.Persist(splitSource, "extra", library, "v1");
+        catalog.Persist(splitSource, "film", library, "v1");
+        catalog.Persist(splitLibrary, "film", library, "v1");
+        catalog.Adopt([first, staleVersion, currentVersion, hiddenSource, keptSource, outsideLibrary, insideLibrary]);
+        catalog.Save();
+        catalog.Fixture.Store.HideItem(splitSource, "extra");
+
+        var response = await catalog.Search("distinct-search", new SearchRequest { GroupByVideo = false, Limit = 50 }, TestContext.Current.CancellationToken);
+        var returned = response.Results.Select(hit => hit.SegmentId).ToHashSet();
+        Assert.Equal(4, response.Results.Count);
+        Assert.Contains(first.SegmentId, returned);
+        Assert.Contains(currentVersion.SegmentId, returned);
+        Assert.Contains(keptSource.SegmentId, returned);
+        Assert.Contains(insideLibrary.SegmentId, returned);
+        Assert.DoesNotContain(staleVersion.SegmentId, returned);
+        Assert.DoesNotContain(hiddenSource.SegmentId, returned);
+        Assert.DoesNotContain(outsideLibrary.SegmentId, returned);
+        Assert.Equal("referenceTailR", response.QualityPolicy.ScoreMeaning);
+        Assert.Equal(1, catalog.Calls);
+    }
+
+    [Fact]
+    public async Task Fresh_search_revocation_filters_the_ranked_list_before_choosing_the_page()
+    {
+        using var catalog = Catalog.Create();
+        catalog.Add("joint", catalog.FilmA, "film", 0, 120, Tilt(0.1));
+        var blocked = catalog.Add("joint", catalog.FilmB, "film", 2000, 2120, Tilt(0.95));
+        catalog.Add("joint", catalog.FilmB, "film", 3000, 3120, Tilt(0.9));
+        var filler = catalog.Add("joint", Guid.NewGuid(), "film", 8000, 8120, Tilt(0.5));
+        var backup = catalog.Add("joint", Guid.NewGuid(), "film", 9000, 9120, Tilt(0.3));
+        catalog.Save();
+        catalog.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (item == catalog.FilmB)
+            {
+                catalog.Fixture.Allow.Remove(catalog.FilmB);
+            }
+        };
+
+        var published = await catalog.Search("revoked-search", new SearchRequest { GroupByVideo = true, Limit = 2 }, TestContext.Current.CancellationToken);
+        Assert.Equal(new[] { filler.ItemId, backup.ItemId }, published.Results.Select(hit => hit.ItemId).Distinct().ToArray());
+        Assert.DoesNotContain(published.Results, hit => hit.ItemId == catalog.FilmB || hit.SegmentId == blocked.SegmentId);
+        Assert.Equal(1, catalog.Calls);
+    }
+
+    [Fact]
+    public async Task Fresh_search_library_removal_backfills_and_a_new_signature_is_rejected()
+    {
+        using var catalog = Catalog.Create();
+        var otherLibrary = Guid.NewGuid();
+        var weak = Window(catalog.FilmA, "film", catalog.LibraryId, "v1", 0, Tilt(0.1));
+        var moved = Window(catalog.FilmB, "film", otherLibrary, "v1", 2000, Tilt(0.95));
+        var filler = Window(Guid.NewGuid(), "film", catalog.LibraryId, "v1", 8000, Tilt(0.5));
+        var backup = Window(Guid.NewGuid(), "film", catalog.LibraryId, "v1", 9000, Tilt(0.3));
+        catalog.Persist(weak.ItemId, weak.MediaSourceId, catalog.LibraryId, "v1");
+        catalog.Persist(moved.ItemId, moved.MediaSourceId, otherLibrary, "v1");
+        catalog.Persist(filler.ItemId, filler.MediaSourceId, catalog.LibraryId, "v1");
+        catalog.Persist(backup.ItemId, backup.MediaSourceId, catalog.LibraryId, "v1");
+        catalog.Adopt([weak, moved, filler, backup]);
+        catalog.Fixture.Store.ReplaceLibraries([catalog.LibraryId, otherLibrary]);
+        catalog.Save();
+        catalog.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (item == weak.ItemId)
+            {
+                catalog.Fixture.Store.ReplaceLibraries([catalog.LibraryId]);
+            }
+        };
+
+        var published = await catalog.Search("library-search", new SearchRequest { GroupByVideo = true, Limit = 2 }, TestContext.Current.CancellationToken);
+        Assert.Equal(new[] { filler.ItemId, backup.ItemId }, published.Results.Select(hit => hit.ItemId).Distinct().ToArray());
+        Assert.DoesNotContain(published.Results, hit => hit.ItemId == moved.ItemId);
+
+        using var signed = Catalog.Create();
+        var visible = signed.Add("joint", signed.FilmA, "film", 0, 120, Axis(0));
+        signed.Add("joint", signed.FilmB, "film", 5000, 5120, Axis(0));
+        signed.Save();
+        var rebuilt = false;
+        var snapshots = signed.Fixture.Store.CandidateSnapshotReads;
+        signed.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (!rebuilt && item != visible.ItemId)
+            {
+                rebuilt = true;
+                signed.Fixture.Store.BeginRebuild(Fixture.Model("proc-a"));
+            }
+        };
+        var blocked = await signed.Search("signature-search", cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal("incompatible", blocked.Availability.Search);
+        Assert.Empty(blocked.Results);
+        Assert.True(rebuilt);
+        Assert.Equal(snapshots + 3, signed.Fixture.Store.CandidateSnapshotReads);
+        Assert.Equal(2, catalog.Calls + signed.Calls);
+    }
+
+    [Fact]
+    public async Task Search_cancellation_does_not_start_the_next_source_or_the_fresh_snapshot()
+    {
+        using var catalog = Catalog.Create();
+        var first = catalog.Add("joint", catalog.FilmA, "film", 0, 120, Axis(0));
+        catalog.Add("joint", catalog.FilmA, "film", 5000, 5120, Axis(0));
+        var other = catalog.Add("joint", catalog.FilmB, "film", 8000, 8120, Axis(0));
+        catalog.Save();
+        using var during = new CancellationTokenSource();
+        var probed = new List<Guid>();
+        catalog.Fixture.OnReadFacts = (item, _) =>
+        {
+            probed.Add(item);
+            during.Cancel();
+        };
+        var snapshots = catalog.Fixture.Store.CandidateSnapshotReads;
+        var versions = catalog.Fixture.Store.StoredContentVersionReads;
+        var access = catalog.Fixture.AccessChecks;
+        await Assert.ThrowsAsync<OperationCanceledException>(() => catalog.Search("cancel-search", cancellationToken: during.Token));
+        Assert.Equal(new[] { first.ItemId }, probed);
+        Assert.DoesNotContain(other.ItemId, probed);
+        Assert.Equal(snapshots + 2, catalog.Fixture.Store.CandidateSnapshotReads);
+        Assert.Equal(versions + 2, catalog.Fixture.Store.StoredContentVersionReads);
+        Assert.Equal(access + 1, catalog.Fixture.AccessChecks);
+        Assert.Equal(1, catalog.Calls);
+    }
+
+    [Fact]
+    public async Task Main_diagnostics_keeps_partial_coverage_for_off_page_sources()
+    {
+        using var catalog = Catalog.Create();
+        for (var index = 0; index < 4; index++)
+        {
+            catalog.Add("joint", Guid.NewGuid(), "film", 0, 120, Axis(0));
+        }
+
+        catalog.Save();
+        using (var connection = new SqliteConnection("Data Source=" + catalog.Fixture.Store.DatabasePath))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE media SET state = 'partial'";
+            command.ExecuteNonQuery();
+        }
+
+        var response = await catalog.Fixture.Runtime.SearchAsync(catalog.Fixture.UserId, new SearchRequest
+        {
+            Query = "coverage-regression",
+            GroupByVideo = true,
+            Limit = 1,
+            Diagnostics = true
+        }, TestContext.Current.CancellationToken);
+        Assert.Single(response.Results);
+        Assert.False(response.Results[0].IndexComplete);
+        var raw = response.RawResults;
+        Assert.NotNull(raw);
+        Assert.Equal(4, raw.Count);
+        Assert.All(raw, hit => Assert.False(hit.IndexComplete));
+    }
+
+    [Fact]
+    public async Task Diagnostics_reports_real_coverage_on_and_off_the_page()
+    {
+        using var catalog = Catalog.Create();
+        var shown = catalog.Add("joint", Guid.NewGuid(), "film", 0, 120, Tilt(0.99));
+        var partial = catalog.Add("joint", Guid.NewGuid(), "film", 2000, 2120, Tilt(0.5));
+        catalog.Add("joint", partial.ItemId, "film", 4000, 4120, Tilt(0.4));
+        var complete = catalog.Add("joint", Guid.NewGuid(), "film", 8000, 8120, Tilt(0.2));
+        catalog.Save();
+        using (var connection = new SqliteConnection("Data Source=" + catalog.Fixture.Store.DatabasePath))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE media SET state = 'partial' WHERE item_id = $item";
+            command.Parameters.AddWithValue("$item", partial.ItemId.ToString("D"));
+            command.ExecuteNonQuery();
+        }
+
+        var states = catalog.Fixture.Store.MediaStateReads;
+        var response = await catalog.Fixture.Runtime.SearchAsync(catalog.Fixture.UserId, new SearchRequest
+        {
+            Query = "mixed-coverage",
+            GroupByVideo = true,
+            Limit = 1,
+            Diagnostics = true
+        }, TestContext.Current.CancellationToken);
+        var raw = response.RawResults;
+        Assert.NotNull(raw);
+        Assert.Equal(4, raw.Count);
+        Assert.Equal(3, catalog.Fixture.Store.MediaStateReads - states);
+        Assert.True(catalog.Fixture.Store.MediaStateReads - states < raw.Count);
+        var page = Assert.Single(response.Results);
+        Assert.Equal(shown.ItemId, page.ItemId);
+        Assert.True(page.IndexComplete);
+        Assert.Contains(raw, hit => hit.ItemId == shown.ItemId && hit.IndexComplete);
+        Assert.Equal(2, raw.Count(hit => hit.ItemId == partial.ItemId && !hit.IndexComplete));
+        Assert.Contains(raw, hit => hit.ItemId == complete.ItemId && hit.IndexComplete);
+        Assert.Contains(raw, hit => hit.ItemId != shown.ItemId && hit.IndexComplete);
+        Assert.Contains(raw, hit => hit.ItemId != shown.ItemId && !hit.IndexComplete);
+    }
+
     private static CandidateRow Row(Guid item, string source, Guid segment, long start, long end) => new()
     {
         ItemId = item,
@@ -554,13 +873,13 @@ public class SimilarSegmentTests
         return vector;
     }
 
-    private static CandidateRow Window(Guid item, string source, Guid library, string version, long start, double[] vector)
+    private static CandidateRow Window(Guid item, string source, Guid library, string version, long start, double[] vector, string channel = "joint")
     {
         var end = start + 120;
         return new CandidateRow
         {
             SegmentId = Guid.NewGuid(),
-            CandidateId = "joint:" + item.ToString("N") + ":" + source + ":" + version + ":" + start,
+            CandidateId = channel + ":" + item.ToString("N") + ":" + source + ":" + version + ":" + start,
             ItemId = item,
             MediaSourceId = source,
             LibraryId = library,
@@ -644,7 +963,21 @@ public class SimilarSegmentTests
             return row;
         }
 
-        public void Adopt(IReadOnlyList<CandidateRow> rows) => Joint.Candidates = rows.ToArray();
+        public void Adopt(IReadOnlyList<CandidateRow> rows, IReadOnlyList<CandidateRow>? text = null)
+        {
+            Joint.Candidates = rows.ToArray();
+            if (text is not null)
+            {
+                Text.Candidates = text.ToArray();
+            }
+        }
+
+        public Task<SearchResponse> Search(string query, SearchRequest? template = null, CancellationToken cancellationToken = default)
+        {
+            var request = template ?? new SearchRequest();
+            request.Query = query;
+            return Fixture.Runtime.SearchAsync(Fixture.UserId, request, cancellationToken);
+        }
 
         public void Persist(Guid item, string source, Guid library, string version)
         {
