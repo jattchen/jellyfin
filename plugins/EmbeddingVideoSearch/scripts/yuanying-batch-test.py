@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sqlite3
 import sys
 import unittest
@@ -1496,6 +1497,206 @@ class AudioGapBatch(unittest.TestCase):
         )
         self.assertEqual(matched["sent"], [])
         self.assertEqual(matched["reused"], ["joint-1"])
+
+
+class FrozenSourceSelection(unittest.TestCase):
+    def test_explicit_policy_ignores_one_extra_and_keeps_frozen_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            first = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            second = source_file(
+                root / "media", "film-F002.mp4", str(uuid.uuid4()), 200_000_000, label="F002",
+            )
+            (root / "media" / "notes.txt").write_text("skip", encoding="utf-8")
+            extra = root / "media" / "extra.mp4"
+            extra.write_bytes(b"not-on-the-frozen-list")
+            config = config_for(root, [first, second], output)
+            config["expectedFilmCount"] = 2
+            frozen_windows = [
+                len(batch.plan_film_windows(first["source"]["runtimeTicks"])),
+                len(batch.plan_film_windows(second["source"]["runtimeTicks"])),
+            ]
+
+            strict = batch.preflight(config)
+            self.assertFalse(strict["ready"])
+            self.assertEqual(strict["missingFiles"], 1)
+            self.assertEqual(strict["ignoredExtraFiles"], 0)
+            self.assertEqual(strict["films"], 2)
+            self.assertEqual(strict["catalog"], [])
+            self.assertNotIn("sourceSelectionPolicy", strict)
+            self.assertFalse(output.exists())
+            calls = []
+            code, run_summary = batch.run_batch(
+                config,
+                execute=lambda label, stage: calls.append((label, stage)) or 0,
+                send=lambda label, stage, entry: calls.append(("send", label)),
+            )
+            self.assertEqual(code, 1)
+            self.assertFalse(run_summary["ready"])
+            self.assertEqual(run_summary["missingFiles"], 1)
+            self.assertEqual(calls, [])
+            self.assertFalse(output.exists())
+            config["sourceSelectionPolicy"] = ""
+            empty = batch.preflight(config)
+            self.assertFalse(empty["ready"])
+            self.assertEqual(empty["missingFiles"], 1)
+            self.assertEqual(empty["ignoredExtraFiles"], 0)
+            self.assertFalse(output.exists())
+            del config["sourceSelectionPolicy"]
+
+            extra.unlink()
+            baseline = batch.preflight(config)
+            self.assertTrue(baseline["ready"])
+            self.assertEqual([row["label"] for row in baseline["catalog"]], ["F001", "F002"])
+            self.assertEqual([row["windows"] for row in baseline["catalog"]], frozen_windows)
+            self.assertEqual(baseline["ignoredExtraFiles"], 0)
+            self.assertNotIn("sourceSelectionPolicy", baseline)
+            identities = {
+                "manifest": output / "manifest.json",
+                "f001-embed": output / "films" / "F001" / "embed" / "protocol.json",
+                "f001-asr": output / "films" / "F001" / "asr" / "protocol.json",
+                "f002-embed": output / "films" / "F002" / "embed" / "protocol.json",
+                "f002-asr": output / "films" / "F002" / "asr" / "protocol.json",
+            }
+            cache = output / "films" / "F001" / "embed" / "joint" / "kept.json"
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_bytes(b"succeeded-cache")
+            identities["cache"] = cache
+            frozen_bytes = {name: path.read_bytes() for name, path in identities.items()}
+            baseline_ids = [row["itemId"] for row in baseline["catalog"]]
+
+            extra.write_bytes(b"not-on-the-frozen-list")
+            config["sourceSelectionPolicy"] = batch.SOURCE_SELECTION_POLICY
+            selected = batch.preflight(config)
+            self.assertTrue(selected["ready"])
+            self.assertEqual(selected["sourceSelectionPolicy"], batch.SOURCE_SELECTION_POLICY)
+            self.assertEqual(selected["ignoredExtraFiles"], 1)
+            self.assertEqual(selected["missingFiles"], 0)
+            self.assertEqual(selected["unmatchedFacts"], 0)
+            self.assertEqual(selected["sourceDrift"], 0)
+            self.assertEqual(selected["films"], 2)
+            self.assertEqual(selected["skippedFiles"], 1)
+            self.assertEqual([row["label"] for row in selected["catalog"]], ["F001", "F002"])
+            self.assertEqual([row["windows"] for row in selected["catalog"]], frozen_windows)
+            self.assertEqual([row["itemId"] for row in selected["catalog"]], baseline_ids)
+            self.assertFalse((output / "films" / "F003").exists())
+            for name, path in identities.items():
+                self.assertEqual(path.read_bytes(), frozen_bytes[name], name)
+            manifest = batch.read_json(output / "manifest.json")
+            self.assertNotIn("sourceSelectionPolicy", manifest)
+            self.assertEqual([film["label"] for film in manifest["films"]], ["F001", "F002"])
+            protocol = batch.read_json(identities["f001-embed"])
+            self.assertNotIn("sourceSelectionPolicy", protocol)
+            self.assertNotIn("source_selection_policy", protocol)
+            written = batch.read_json(output / "preflight.json")
+            self.assertEqual(written["sourceSelectionPolicy"], batch.SOURCE_SELECTION_POLICY)
+            self.assertEqual(written["ignoredExtraFiles"], 1)
+            self.assertEqual(written["windows"], sum(frozen_windows))
+
+            held = root / "held-film"
+            Path(first["source"]["sourcePath"]).rename(held)
+            hidden = batch.preflight(config)
+            self.assertFalse(hidden["ready"])
+            self.assertEqual(hidden["unmatchedFacts"], 1)
+            self.assertEqual(hidden["sourceDrift"], 0)
+            self.assertEqual(hidden["missingFiles"], 0)
+            self.assertEqual(hidden["ignoredExtraFiles"], 1)
+            self.assertEqual(hidden["catalog"], [])
+            self.assertEqual((output / "manifest.json").read_bytes(), frozen_bytes["manifest"])
+            held.rename(first["source"]["sourcePath"])
+
+            second_path = Path(second["source"]["sourcePath"])
+            original = second_path.read_bytes()
+            mtime_ns = second_path.stat().st_mtime_ns
+            second_path.write_bytes(original + b"x")
+            drifted = batch.preflight(config)
+            self.assertFalse(drifted["ready"])
+            self.assertEqual(drifted["sourceDrift"], 1)
+            self.assertEqual(drifted["missingFiles"], 0)
+            self.assertEqual(drifted["unmatchedFacts"], 0)
+            self.assertEqual(drifted["ignoredExtraFiles"], 1)
+            self.assertEqual(drifted["catalog"], [])
+            self.assertEqual((output / "manifest.json").read_bytes(), frozen_bytes["manifest"])
+            self.assertEqual(cache.read_bytes(), frozen_bytes["cache"])
+            second_path.write_bytes(original)
+            os.utime(second_path, ns=(mtime_ns, mtime_ns))
+            restored = batch.preflight(config)
+            self.assertTrue(restored["ready"])
+            self.assertEqual([row["label"] for row in restored["catalog"]], ["F001", "F002"])
+            self.assertEqual([row["windows"] for row in restored["catalog"]], frozen_windows)
+            for name, path in identities.items():
+                self.assertEqual(path.read_bytes(), frozen_bytes[name], name)
+
+            fresh = root / "fresh-output"
+            refused = dict(config)
+            refused["outputRoot"] = str(fresh)
+            refused["sourceSelectionPolicy"] = "include-new-files"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(refused)
+            self.assertEqual(caught.exception.reason, "config")
+            self.assertFalse(fresh.exists())
+            self.assertEqual((output / "manifest.json").read_bytes(), frozen_bytes["manifest"])
+
+    def test_policy_still_refuses_duplicate_identity_and_probe_anomalies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            clone = json.loads(json.dumps(row))
+            other = str(uuid.uuid4())
+            clone["label"] = "F002"
+            clone["source"]["itemId"] = other
+            clone["source"]["sourceItemId"] = other
+            (root / "media" / "extra.mp4").write_bytes(b"extra")
+            config = config_for(root, [row, clone], output)
+            config["sourceSelectionPolicy"] = batch.SOURCE_SELECTION_POLICY
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "source-mismatch")
+            self.assertFalse(output.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["source"]["sourceItemId"] = str(uuid.uuid4())
+            config = config_for(root, [row], output)
+            config["sourceSelectionPolicy"] = batch.SOURCE_SELECTION_POLICY
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "source-mismatch")
+            self.assertFalse(output.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            short = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), 1_000_000, label="F001")
+            (root / "media" / "extra.mp4").write_bytes(b"extra")
+            config = config_for(root, [short], output)
+            config["sourceSelectionPolicy"] = batch.SOURCE_SELECTION_POLICY
+            config["expectedFilmCount"] = 1
+            summary = batch.preflight(config)
+            self.assertFalse(summary["ready"])
+            self.assertEqual(summary["ineligible"], 1)
+            self.assertEqual(summary["ignoredExtraFiles"], 1)
+            self.assertEqual(summary["missingFiles"], 0)
+            self.assertEqual(summary["catalog"], [])
+            self.assertFalse(output.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["probe"] = duration_probe("12.000000", "11.500000")
+            (root / "media" / "extra.mp4").write_bytes(b"extra")
+            config = config_for(root, [row], output)
+            config["sourceSelectionPolicy"] = batch.SOURCE_SELECTION_POLICY
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "video-tail")
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

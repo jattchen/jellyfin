@@ -38,6 +38,10 @@
 
 `label` 使用清单里的 `F001` 这种编号，不按文件名重新编号。只处理源目录顶层的 mp4，其它文件和子目录跳过。
 
+默认不写 `sourceSelectionPolicy`。源目录顶层多出来的 mp4 不在冻结清单里时，准备不会就绪。`missingFiles` 表示目录里有这份 mp4，清单里没有对应路径。清单上的片子不在目录里，计入未匹配。大小或修改时间与清单不同，计入漂移。
+
+只有显式写成 `frozen-facts-only-v1` 时，这些清单外的 mp4 才被忽略，并单独计入 `ignoredExtraFiles`。它们不进入 manifest，不分配新编号，也不产生窗口。原来清单上的任何一部缺失、大小或时间变化、编号或路径重复、身份字段对不上、窗口规划失败或探针异常，仍然拒绝。空字符串与不写这个字段相同，保持上面的拒绝。其它字符串在准备阶段拒绝，原因是 `config`。这个字段只在 `preflight` 和 `run` 读取配置时生效。它不写入每部片的协议，也不改写已经存在的 manifest 和成功缓存。忽略新增文件表示这一轮仍只准备冻结清单里的片子，不是整批已经完成。
+
 ## 解释器
 
 验收和编排命令使用：
@@ -72,6 +76,7 @@
   "transcriptionLanguagePolicy": "auto-v1",
   "unsupportedAlignLanguagePolicy": "unsupported-align-language-skip-v1",
   "alignmentTimePolicy": "last-unit-tail-80ms-v1",
+  "sourceSelectionPolicy": "frozen-facts-only-v1",
   "recoverySource": "$OLD_OUTPUT",
   "recoverySnapshot": "$V2_SNAPSHOT",
   "storageInterruptionRecovery": {
@@ -92,6 +97,8 @@
 `$FROZEN_SOURCES` 是只读的冻结清单。`$EMPTY_TEMPLATE` 是空索引模板，文件名必须以 `.template.db` 结尾。`$NEW_INDEX_DIR` 必须是一个还不存在的新目录。输出目录不能放进样本目录、`asr-` 目录或正在使用的索引目录。
 
 `unsupportedAlignLanguagePolicy` 可以不写。不写时保持严格停下。恢复时才写上面的版本值。`alignmentTimePolicy` 也可以不写。不写时，末字越界仍按失败停下。写了之后，只有新的、还没做完的转写协议会带上这条规则。已经做完的协议不会因为只改顶层配置而更新，所以要换一个新的输出目录。
+
+`sourceSelectionPolicy` 也可以不写。不写或写成空字符串时，目录里多出来的 mp4 会让准备不就绪。只有新的配置副本需要忽略这些文件时，才写成 `frozen-facts-only-v1`。已经准备好的输出不用因此重做协议。旧的失败配置保持原样。
 
 `recoverySource` 是旧输出目录，只读。`recoverySnapshot` 是这份旧输出的文件清单，每一项有路径、大小和 sha256。恢复前先核对清单和磁盘一致。新的 `outputRoot` 必须是另一个还不存在的目录。它可以和旧目录不在同一块盘上。
 

@@ -30,6 +30,7 @@ EXPECTED_PROCESSING_ID = "eg2-7c43611ad2e20661c3d3"
 LANGUAGE_POLICY = "auto-v1"
 UNSUPPORTED_ALIGN_SKIP_POLICY = "unsupported-align-language-skip-v1"
 ALIGNMENT_TIME_POLICY = "last-unit-tail-80ms-v1"
+SOURCE_SELECTION_POLICY = "frozen-facts-only-v1"
 MODEL_CONCURRENCY = 1
 TRANSCRIBE_STAGES = ("prepare", "asr", "align", "documents")
 EMBED_STAGES = ("joint", "text")
@@ -236,6 +237,9 @@ def require_config(config):
     audio_gap = config.get("audioGapPolicy", None)
     if audio_gap not in (None, "", contract.AUDIO_GAP_POLICY):
         raise BatchBlocked("unknown audio gap policy", reason="config")
+    selection = config.get("sourceSelectionPolicy", None)
+    if selection not in (None, "", SOURCE_SELECTION_POLICY):
+        raise BatchBlocked("unknown source selection policy", reason="config")
     for key in ("sourceDirectory", "sourceFacts", "outputRoot", "workerPython", "asrModel", "alignerModel"):
         if not config.get(key):
             raise BatchBlocked("config missing " + key, reason="config")
@@ -300,7 +304,17 @@ def load_facts(path):
     return facts
 
 
-def match_facts(directory, facts):
+def match_facts(directory, facts, *, source_selection=None):
+    """Match top-level mp4 files to frozen facts.
+
+    source_selection None or "" keeps the strict count: a file with no fact
+    increments missingFiles. frozen-facts-only-v1 leaves that file out of the
+    film list and counts it as ignoredExtraFiles. A missing, changed,
+    or duplicate frozen entry is refused either way. Paths are not returned.
+    """
+    if source_selection not in (None, "", SOURCE_SELECTION_POLICY):
+        raise BatchBlocked("unknown source selection policy", reason="config")
+    ignore_extras = source_selection == SOURCE_SELECTION_POLICY
     included, skipped = list_media(directory)
     by_path = {}
     for fact in facts:
@@ -308,11 +322,16 @@ def match_facts(directory, facts):
         if key in by_path:
             raise BatchBlocked("duplicate source path in facts", reason="source-mismatch")
         by_path[key] = fact
-    missing, matched, drift = [], [], []
+    missing = 0
+    ignored = 0
+    matched, drift = [], []
     for path in included:
         fact = by_path.pop(canonical_path(path), None)
         if fact is None:
-            missing.append(path)
+            if ignore_extras:
+                ignored += 1
+            else:
+                missing += 1
             continue
         source = fact["source"]
         stat = path.stat()
@@ -323,10 +342,11 @@ def match_facts(directory, facts):
     unmatched_facts = [contract.canonical_item(fact["source"]["itemId"]) for fact in by_path.values()]
     return {
         "matched": matched,
-        "missingFiles": len(missing),
+        "missingFiles": missing,
         "unmatchedFacts": unmatched_facts,
         "drift": drift,
         "skipped": len(skipped),
+        "ignoredExtraFiles": ignored,
     }
 
 
@@ -1255,7 +1275,10 @@ def preflight(config, *, check_model=False):
     require_local_model(config["asrModel"])
     require_local_model(config["alignerModel"])
     reject_protocol_drift(config)
-    found = match_facts(config["sourceDirectory"], load_facts(config["sourceFacts"]))
+    found = match_facts(
+        config["sourceDirectory"], load_facts(config["sourceFacts"]),
+        source_selection=config.get("sourceSelectionPolicy", None),
+    )
     eligible, ineligible = [], []
     for _path, fact in found["matched"]:
         try:
@@ -1305,6 +1328,7 @@ def preflight(config, *, check_model=False):
         "films": len(films),
         "skippedFiles": found["skipped"],
         "missingFiles": found["missingFiles"],
+        "ignoredExtraFiles": found["ignoredExtraFiles"],
         "unmatchedFacts": len(found["unmatchedFacts"]),
         "sourceDrift": len(found["drift"]),
         "ineligible": len(ineligible),
@@ -1328,6 +1352,8 @@ def preflight(config, *, check_model=False):
         summary["pictureMap"] = picture_map
     if config.get("audioGapPolicy") == contract.AUDIO_GAP_POLICY:
         summary["audioGapPolicy"] = contract.AUDIO_GAP_POLICY
+    if config.get("sourceSelectionPolicy") == SOURCE_SELECTION_POLICY:
+        summary["sourceSelectionPolicy"] = SOURCE_SELECTION_POLICY
     if ready:
         write_json(Path(config["outputRoot"]) / "preflight.json", summary)
     return summary
