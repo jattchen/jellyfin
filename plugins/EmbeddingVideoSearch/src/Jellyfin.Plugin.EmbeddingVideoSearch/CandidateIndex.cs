@@ -144,6 +144,16 @@ public static class CandidateRanking
         return Sum(query.Select((v, i) => (double)v * document[i]));
     }
 
+    public static double Dot(double[] query, double[] document)
+    {
+        if (query.Length != ApiV1.Dimension || document.Length != query.Length)
+        {
+            throw new InvalidDataException("Candidate dimension mismatch.");
+        }
+
+        return Sum(query.Select((value, index) => value * document[index]));
+    }
+
     public static double ReferenceScore(double similarity, CandidateRepresentation representation)
     {
         if (!double.IsFinite(similarity))

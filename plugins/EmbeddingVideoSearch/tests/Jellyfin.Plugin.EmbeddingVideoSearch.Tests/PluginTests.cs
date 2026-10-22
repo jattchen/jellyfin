@@ -505,6 +505,7 @@ internal sealed class Fixture : IDisposable
     public HashSet<Guid> Allow { get; } = [];
     public HashSet<Guid> Containers { get; } = [];
     public HashSet<(Guid ItemId, Guid ParentId)> Parents { get; } = [];
+    public Action<Guid, string>? OnReadFacts { get; set; }
     public bool Disabled { get; set; }
     public TaskCompletionSource<bool>? EmbedRelease { get; set; }
     public TaskCompletionSource<bool>? EmbedEntered { get; set; }
@@ -531,7 +532,8 @@ internal sealed class Fixture : IDisposable
         access.Owner = fixture;
         var libraries = new FakeLibraries();
         libraries.Owner = fixture;
-        fixture.Runtime = new SearchRuntime(store, embeddings, access, libraries, new Version(12, 2, 0), new EchoFacts(store));
+        var facts = new EchoFacts(store) { Owner = fixture };
+        fixture.Runtime = new SearchRuntime(store, embeddings, access, libraries, new Version(12, 2, 0), facts);
         return fixture;
     }
 
@@ -599,8 +601,11 @@ internal sealed class EchoFacts : IMediaFacts
 
     public EchoFacts(IndexStore store) => _store = store;
 
+    public Fixture? Owner { get; set; }
+
     public CatalogItem ReadSource(Guid itemId, string mediaSourceId, IReadOnlyCollection<Guid> enabledLibraryIds)
     {
+        Owner?.OnReadFacts?.Invoke(itemId, mediaSourceId);
         var version = _store.ReadStoredContentVersion(itemId, mediaSourceId);
         if (version is null)
         {

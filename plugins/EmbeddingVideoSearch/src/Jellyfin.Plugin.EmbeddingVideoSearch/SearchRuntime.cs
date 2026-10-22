@@ -703,7 +703,7 @@ public sealed partial class SearchRuntime : IDisposable
             QualityPolicy = Quality()
         };
         WindowContract.Apply(response.Compatibility, response.Window, active?.WindowVersion);
-        response.Features = [ApiV1.GroupedVideoFeature, ApiV1.CollapsedRunsFeature];
+        response.Features = [ApiV1.GroupedVideoFeature, ApiV1.CollapsedRunsFeature, ApiV1.SimilarSegmentsFeature];
         return response;
     }
 

@@ -123,6 +123,35 @@ public sealed class EmbeddingVideoSearchController : PluginControllerBase
         }
     }
 
+    [HttpPost("similar")]
+    public async Task<ActionResult> Similar(CancellationToken cancellationToken)
+    {
+        if (!TryUser(out var userId, out var error))
+        {
+            return error;
+        }
+
+        try
+        {
+            var body = await ReadBodyAsync(cancellationToken).ConfigureAwait(false);
+            var request = string.IsNullOrWhiteSpace(body) ? null : JsonProtocol.Deserialize<SimilarRequest>(body);
+            if (request is null)
+            {
+                return Error(StatusCodes.Status400BadRequest, "invalidRequest", "Similar JSON is required.");
+            }
+
+            return JsonBody(Runtime.Similar(userId, request, cancellationToken));
+        }
+        catch (SearchInputException ex) when (ex.Code == "invalidRequest")
+        {
+            return Error(StatusCodes.Status400BadRequest, ex.Code, ex.Message);
+        }
+        catch (Exception ex) when (ex is SearchAuthException or SearchInputException or JsonException)
+        {
+            return FromException(ex);
+        }
+    }
+
     [HttpGet("segments/{segmentId}")]
     public ActionResult Segment([FromRoute] string segmentId)
     {

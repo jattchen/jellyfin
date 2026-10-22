@@ -89,6 +89,31 @@ public class ConsecutiveRunTests
     }
 
     [Fact]
+    public void Mixed_representations_keep_the_representative_text_and_another_source_stays_apart()
+    {
+        var film = Guid.NewGuid();
+        var spoken = Hit(film, "film", "v1", 100, 200, 9, "对白原文");
+        spoken.Representation = "transcriptText";
+        var picture = Hit(film, "film", "v1", 200, 300, 4, "画面旁白");
+        var otherSource = Hit(film, "other", "v1", 100, 200, 8, "另一源原文");
+        otherSource.Representation = "transcriptText";
+
+        var collapsed = RunCollapse.Apply([spoken, picture, otherSource], null);
+        Assert.Equal([spoken.SegmentId, otherSource.SegmentId], collapsed.Select(hit => hit.SegmentId).ToArray());
+        Assert.Equal("对白原文", collapsed[0].Transcript);
+        Assert.Equal("transcriptText", collapsed[0].Representation);
+        Assert.Equal(100, collapsed[0].StartTicks);
+        Assert.Equal(200, collapsed[0].EndTicks);
+        var run = collapsed[0].Run;
+        Assert.NotNull(run);
+        Assert.Equal(100, run.StartTicks);
+        Assert.Equal(300, run.EndTicks);
+        Assert.Equal(2, run.MemberCount);
+        Assert.Equal("另一源原文", collapsed[1].Transcript);
+        Assert.Equal(1, collapsed[1].Run?.MemberCount ?? 0);
+    }
+
+    [Fact]
     public async Task Grouped_search_collapses_the_returned_page_and_leaves_the_old_response_unchanged()
     {
         using var fixture = Fixture.Create();
@@ -184,7 +209,7 @@ public class ConsecutiveRunTests
         var capabilities = await fixture.Runtime.CapabilitiesAsync(fixture.UserId, CancellationToken.None);
         Assert.Contains(ApiV1.CollapsedRunsFeature, capabilities.Features);
         Assert.Contains(ApiV1.GroupedVideoFeature, capabilities.Features);
-        Assert.DoesNotContain("similar-segments-v1", capabilities.Features);
+        Assert.Contains(ApiV1.SimilarSegmentsFeature, capabilities.Features);
     }
 
     [Fact]
