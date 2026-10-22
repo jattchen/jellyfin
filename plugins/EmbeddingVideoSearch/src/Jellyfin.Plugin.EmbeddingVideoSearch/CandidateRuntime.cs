@@ -3,21 +3,21 @@ namespace Jellyfin.Plugin.EmbeddingVideoSearch;
 public sealed partial class SearchRuntime
 {
     private SearchResponse SearchCandidates(Guid userId, SearchRequest request, float[] query,
-        CandidateSnapshot candidates, StoredSignature signature, int limit, SearchResponse response)
+        CandidateSnapshot candidates, StoredSignature signature, int limit, SearchResponse response,
+        CancellationToken cancellationToken)
     {
+        // Ranking and publication each keep their own verdicts. One pass remembers a source only for that pass.
+        cancellationToken.ThrowIfCancellationRequested();
         var principal = RequirePrincipal(userId);
         var selection = SelectLibraries(principal, request);
-        bool Allowed(CandidateRow row) => selection.Libraries.Contains(row.LibraryId)
-            && principal.CanAccess(row.ItemId, row.MediaSourceId)
-            && (selection.Container is not Guid parent || _libraries.ItemBelongsToParent(row.ItemId, parent))
-            && _store.ReadStoredContentVersion(row.ItemId, row.MediaSourceId) == row.ContentVersion
-            && FactsMatch(row.ItemId, row.MediaSourceId, row.ContentVersion, selection.Libraries);
+        var probe = new SourceProbe(this, principal, selection, cancellationToken);
+        var ranked = CandidateRanking.Rank(query, candidates, row => probe.Visible(row) && probe.Current(row));
 
-        var ranked = CandidateRanking.Rank(query, candidates, Allowed);
-        // No await follows publication checks. Re-read permissions and versions after ranking.
+        cancellationToken.ThrowIfCancellationRequested();
         principal = RequirePrincipal(userId);
-        selection = SelectLibraries(principal, request);
+        cancellationToken.ThrowIfCancellationRequested();
         var fresh = _store.ReadCandidateSnapshot();
+        cancellationToken.ThrowIfCancellationRequested();
         if (_store.ActiveGeneration != signature.Generation || fresh.Identity != candidates.Identity
             || fresh.Representations.Any(r => !r.Matches(signature)) || _store.Incompatible)
         {
@@ -25,13 +25,27 @@ public sealed partial class SearchRuntime
             return response;
         }
 
-        var allowedIds = candidates.Representations.SelectMany(r => r.Candidates).Where(Allowed).Select(r => r.SegmentId).ToHashSet();
+        selection = SelectLibraries(principal, request);
+        var freshProbe = new SourceProbe(this, principal, selection, cancellationToken);
+        var allowedIds = new HashSet<Guid>();
+        foreach (var representation in fresh.Representations)
+        {
+            foreach (var row in representation.Candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (freshProbe.Visible(row) && freshProbe.Current(row))
+                {
+                    allowedIds.Add(row.SegmentId);
+                }
+            }
+        }
+
         ranked.RemoveAll(hit => !allowedIds.Contains(hit.SegmentId));
-        ApplyStoredCoverage(ranked);
-        response.QualityPolicy = CandidateQuality(candidates);
         var selected = request.GroupByVideo
             ? CandidateRanking.TakeByVideo(ranked, limit, ApiV1.GroupedHitsPerVideo)
             : ranked.Take(limit).ToList();
+        ApplyPageCoverage(selected, cancellationToken);
+        response.QualityPolicy = CandidateQuality(candidates);
         // Collapse only this already returned page. The lower-ranked tail must not extend a run.
         response.Results = request.CollapseRuns ? RunCollapse.Apply(selected, fresh) : selected;
         response.RawResults = request.Diagnostics ? ranked : null;
@@ -93,14 +107,6 @@ public sealed partial class SearchRuntime
         }
 
         return null;
-    }
-
-    private void ApplyStoredCoverage(IEnumerable<SearchHit> hits)
-    {
-        foreach (var hit in hits)
-        {
-            hit.IndexComplete = _store.ReadMediaState(hit.ItemId, hit.MediaSourceId) == "complete";
-        }
     }
 
     private static QualityPolicyBody CandidateQuality(CandidateSnapshot snapshot) => new()
