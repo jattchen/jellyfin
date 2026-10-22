@@ -273,6 +273,7 @@ public sealed partial class IndexStore
     {
         lock (_gate)
         {
+            CandidateSnapshotReads++;
             using var exists = _connection.CreateCommand();
             exists.CommandText = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_representations'";
             if (Convert.ToInt32(exists.ExecuteScalar()) == 0)

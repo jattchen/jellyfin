@@ -306,6 +306,237 @@ public class SimilarSegmentTests
         Assert.Equal(0, catalog.Calls);
     }
 
+    [Fact]
+    public void Real_scale_page_reads_each_source_once_per_pass()
+    {
+        // 117a54 checked every surviving joint window on both passes, about 16354 source checks
+        // across 46 sources, then read media state for every positive hit, about 8176 times.
+        const int windowCount = 8179;
+        const int sourceCount = 46;
+        using var catalog = Catalog.Create();
+        var shared = Axis(0);
+        var films = Enumerable.Range(0, sourceCount).Select(_ => Guid.NewGuid()).ToArray();
+        var rows = new List<CandidateRow>(windowCount);
+        var ordinal = new int[sourceCount];
+        for (var index = 0; index < windowCount; index++)
+        {
+            var sourceIndex = index % sourceCount;
+            var start = ordinal[sourceIndex]++ * 121L;
+            rows.Add(Window(films[sourceIndex], "film", catalog.LibraryId, "v1", start, shared));
+        }
+
+        foreach (var film in films)
+        {
+            catalog.Persist(film, "film", catalog.LibraryId, "v1");
+        }
+
+        catalog.Adopt(rows);
+        catalog.Save();
+        var reference = rows[0];
+        var facts = new Dictionary<Guid, int>();
+        catalog.Fixture.OnReadFacts = (item, _) => facts[item] = facts.GetValueOrDefault(item) + 1;
+        var store = catalog.Fixture.Store;
+        var versions = store.StoredContentVersionReads;
+        var states = store.MediaStateReads;
+        var snapshots = store.CandidateSnapshotReads;
+        var access = catalog.Fixture.AccessChecks;
+        var response = catalog.Ask(reference, "jointAudioVideo", new SimilarRequest { GroupByVideo = true, Limit = 3, CollapseRuns = true });
+
+        Assert.Equal(0, catalog.Calls);
+        Assert.Equal(15, response.Results.Count);
+        Assert.Equal(15, response.Results.Sum(hit => hit.Run!.MemberCount));
+        Assert.All(response.Results, hit =>
+        {
+            Assert.Equal("candidate", hit.Quality);
+            Assert.True(hit.IndexComplete);
+            Assert.True(hit.Score >= 0);
+        });
+        Assert.Equal(sourceCount, facts.Count);
+        Assert.All(facts.Values, count => Assert.Equal(2, count));
+        Assert.Equal(sourceCount * 4, store.StoredContentVersionReads - versions);
+        Assert.Equal(3, store.MediaStateReads - states);
+        Assert.Equal(2, store.CandidateSnapshotReads - snapshots);
+        Assert.Equal(sourceCount * 2, catalog.Fixture.AccessChecks - access);
+
+        var firstItems = response.Results.Select(hit => hit.ItemId).ToHashSet();
+        var victim = firstItems.First(item => item != reference.ItemId);
+        catalog.Fixture.Allow.Remove(victim);
+        facts.Clear();
+        versions = store.StoredContentVersionReads;
+        states = store.MediaStateReads;
+        snapshots = store.CandidateSnapshotReads;
+        access = catalog.Fixture.AccessChecks;
+        var again = catalog.Ask(reference, "jointAudioVideo", new SimilarRequest { GroupByVideo = true, Limit = 3, CollapseRuns = true });
+        Assert.Equal(15, again.Results.Count);
+        Assert.DoesNotContain(again.Results, hit => hit.ItemId == victim);
+        Assert.Contains(again.Results, hit => !firstItems.Contains(hit.ItemId));
+        Assert.Equal(sourceCount - 1, facts.Count);
+        Assert.DoesNotContain(victim, facts.Keys);
+        Assert.All(facts.Values, count => Assert.Equal(2, count));
+        Assert.Equal((sourceCount - 1) * 4, store.StoredContentVersionReads - versions);
+        Assert.Equal(3, store.MediaStateReads - states);
+        Assert.Equal(2, store.CandidateSnapshotReads - snapshots);
+        Assert.Equal(sourceCount * 2, catalog.Fixture.AccessChecks - access);
+        Assert.Equal(0, catalog.Calls);
+    }
+
+    [Fact]
+    public void Distinct_source_version_and_library_do_not_share_a_verdict()
+    {
+        using var catalog = Catalog.Create();
+        var vector = Axis(0);
+        var library = catalog.LibraryId;
+        var otherLibrary = Guid.NewGuid();
+        var referenceItem = Guid.NewGuid();
+        var versioned = Guid.NewGuid();
+        var splitSource = Guid.NewGuid();
+        var splitLibrary = Guid.NewGuid();
+        var reference = Window(referenceItem, "film", library, "v1", 0, vector);
+        var staleVersion = Window(versioned, "film", library, "v2", 1000, vector);
+        var currentVersion = Window(versioned, "film", library, "v1", 2000, vector);
+        var hiddenSource = Window(splitSource, "extra", library, "v1", 3000, vector);
+        var keptSource = Window(splitSource, "film", library, "v1", 4000, vector);
+        var outsideLibrary = Window(splitLibrary, "film", otherLibrary, "v1", 5000, vector);
+        var insideLibrary = Window(splitLibrary, "film", library, "v1", 6000, vector);
+        catalog.Persist(referenceItem, "film", library, "v1");
+        catalog.Persist(versioned, "film", library, "v1");
+        catalog.Persist(splitSource, "extra", library, "v1");
+        catalog.Persist(splitSource, "film", library, "v1");
+        catalog.Persist(splitLibrary, "film", library, "v1");
+        catalog.Adopt([reference, staleVersion, currentVersion, hiddenSource, keptSource, outsideLibrary, insideLibrary]);
+        catalog.Save();
+        catalog.Fixture.Store.HideItem(splitSource, "extra");
+
+        var response = catalog.Ask(reference, "jointAudioVideo", new SimilarRequest { GroupByVideo = false, Limit = 50 });
+        var returned = response.Results.Select(hit => hit.SegmentId).ToHashSet();
+        Assert.Contains(currentVersion.SegmentId, returned);
+        Assert.Contains(keptSource.SegmentId, returned);
+        Assert.Contains(insideLibrary.SegmentId, returned);
+        Assert.DoesNotContain(staleVersion.SegmentId, returned);
+        Assert.DoesNotContain(hiddenSource.SegmentId, returned);
+        Assert.DoesNotContain(outsideLibrary.SegmentId, returned);
+        Assert.Equal(0, catalog.Calls);
+    }
+
+    [Fact]
+    public void Fresh_revocation_filters_the_ranked_list_before_choosing_the_page()
+    {
+        using var catalog = Catalog.Create();
+        var reference = catalog.Add("joint", catalog.FilmA, "film", 0, 120, Axis(0));
+        var targetHigh = catalog.Add("joint", catalog.FilmB, "film", 2000, 2120, Tilt(0.95));
+        catalog.Add("joint", catalog.FilmB, "film", 3000, 3120, Tilt(0.9));
+        var filler = catalog.Add("joint", Guid.NewGuid(), "film", 8000, 8120, Tilt(0.5));
+        var backup = catalog.Add("joint", Guid.NewGuid(), "film", 9000, 9120, Tilt(0.3));
+        catalog.Persist(filler.ItemId, "film", catalog.LibraryId, "v1");
+        catalog.Persist(backup.ItemId, "film", catalog.LibraryId, "v1");
+        catalog.Save();
+        catalog.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (item == catalog.FilmB)
+            {
+                catalog.Fixture.Allow.Remove(catalog.FilmB);
+            }
+        };
+
+        var published = catalog.Ask(reference, "jointAudioVideo", new SimilarRequest { GroupByVideo = true, Limit = 2 });
+        Assert.Equal(new[] { filler.ItemId, backup.ItemId }, published.Results.Select(hit => hit.ItemId).Distinct().ToArray());
+        Assert.DoesNotContain(published.Results, hit => hit.ItemId == catalog.FilmB || hit.SegmentId == targetHigh.SegmentId);
+        Assert.Equal(0, catalog.Calls);
+
+        using var hidden = Catalog.Create();
+        var kept = hidden.Add("joint", hidden.FilmA, "film", 0, 120, Axis(0));
+        hidden.Add("joint", hidden.FilmA, "film", 5000, 5120, Axis(0));
+        hidden.Add("joint", hidden.FilmB, "film", 7000, 7120, Axis(0));
+        hidden.Save();
+        hidden.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (item == hidden.FilmA)
+            {
+                hidden.Fixture.Allow.Remove(hidden.FilmA);
+            }
+        };
+        var lost = Assert.Throws<SearchAuthException>(() => hidden.Ask(kept, "jointAudioVideo"));
+        Assert.Equal(404, lost.Status);
+        Assert.Equal("Segment was not found.", lost.Message);
+        Assert.Equal(2, hidden.Fixture.Store.CandidateSnapshotReads);
+    }
+
+    [Fact]
+    public void Fresh_library_removal_backfills_and_a_new_signature_is_rejected()
+    {
+        using var catalog = Catalog.Create();
+        var otherLibrary = Guid.NewGuid();
+        var reference = Window(catalog.FilmA, "film", catalog.LibraryId, "v1", 0, Axis(0));
+        var moved = Window(catalog.FilmB, "film", otherLibrary, "v1", 2000, Tilt(0.95));
+        var filler = Window(Guid.NewGuid(), "film", catalog.LibraryId, "v1", 8000, Tilt(0.5));
+        var backup = Window(Guid.NewGuid(), "film", catalog.LibraryId, "v1", 9000, Tilt(0.3));
+        catalog.Persist(reference.ItemId, reference.MediaSourceId, catalog.LibraryId, "v1");
+        catalog.Persist(moved.ItemId, moved.MediaSourceId, otherLibrary, "v1");
+        catalog.Persist(filler.ItemId, filler.MediaSourceId, catalog.LibraryId, "v1");
+        catalog.Persist(backup.ItemId, backup.MediaSourceId, catalog.LibraryId, "v1");
+        catalog.Adopt([reference, moved, filler, backup]);
+        catalog.Fixture.Store.ReplaceLibraries([catalog.LibraryId, otherLibrary]);
+        catalog.Save();
+        catalog.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (item == reference.ItemId)
+            {
+                catalog.Fixture.Store.ReplaceLibraries([catalog.LibraryId]);
+            }
+        };
+
+        var published = catalog.Ask(reference, "jointAudioVideo", new SimilarRequest { GroupByVideo = true, Limit = 2 });
+        Assert.Equal(new[] { filler.ItemId, backup.ItemId }, published.Results.Select(hit => hit.ItemId).Distinct().ToArray());
+        Assert.DoesNotContain(published.Results, hit => hit.ItemId == moved.ItemId);
+
+        using var signed = Catalog.Create();
+        var visible = signed.Add("joint", signed.FilmA, "film", 0, 120, Axis(0));
+        signed.Add("joint", signed.FilmB, "film", 5000, 5120, Axis(0));
+        signed.Save();
+        var rebuilt = false;
+        signed.Fixture.OnReadFacts = (item, _) =>
+        {
+            if (!rebuilt && item != visible.ItemId)
+            {
+                rebuilt = true;
+                signed.Fixture.Store.BeginRebuild(Fixture.Model("proc-a"));
+            }
+        };
+        var blocked = Assert.Throws<SearchInputException>(() => signed.Ask(visible, "jointAudioVideo"));
+        Assert.Equal("incompatible", blocked.Code);
+        Assert.True(rebuilt);
+        Assert.Equal(2, signed.Fixture.Store.CandidateSnapshotReads);
+        Assert.Equal(0, catalog.Calls + signed.Calls);
+    }
+
+    [Fact]
+    public void Cancellation_does_not_start_the_next_source_or_the_second_snapshot()
+    {
+        using var catalog = Catalog.Create();
+        var reference = catalog.Add("joint", catalog.FilmA, "film", 0, 120, Axis(0));
+        catalog.Add("joint", catalog.FilmA, "film", 5000, 5120, Axis(0));
+        var other = catalog.Add("joint", catalog.FilmB, "film", 8000, 8120, Axis(0));
+        catalog.Save();
+        using var during = new CancellationTokenSource();
+        var probed = new List<Guid>();
+        catalog.Fixture.OnReadFacts = (item, _) =>
+        {
+            probed.Add(item);
+            during.Cancel();
+        };
+        var snapshots = catalog.Fixture.Store.CandidateSnapshotReads;
+        var versions = catalog.Fixture.Store.StoredContentVersionReads;
+        var access = catalog.Fixture.AccessChecks;
+        Assert.Throws<OperationCanceledException>(() => catalog.Fixture.Runtime.Similar(
+            catalog.Fixture.UserId, catalog.Request(reference, "jointAudioVideo"), during.Token));
+        Assert.Equal(new[] { reference.ItemId }, probed);
+        Assert.DoesNotContain(other.ItemId, probed);
+        Assert.Equal(snapshots + 1, catalog.Fixture.Store.CandidateSnapshotReads);
+        Assert.Equal(versions + 2, catalog.Fixture.Store.StoredContentVersionReads);
+        Assert.Equal(access + 1, catalog.Fixture.AccessChecks);
+        Assert.Equal(0, catalog.Calls);
+    }
+
     private static CandidateRow Row(Guid item, string source, Guid segment, long start, long end) => new()
     {
         ItemId = item,
@@ -321,6 +552,26 @@ public class SimilarSegmentTests
         var vector = Axis(0);
         vector[0] = -1;
         return vector;
+    }
+
+    private static CandidateRow Window(Guid item, string source, Guid library, string version, long start, double[] vector)
+    {
+        var end = start + 120;
+        return new CandidateRow
+        {
+            SegmentId = Guid.NewGuid(),
+            CandidateId = "joint:" + item.ToString("N") + ":" + source + ":" + version + ":" + start,
+            ItemId = item,
+            MediaSourceId = source,
+            LibraryId = library,
+            ContentVersion = version,
+            StartTicks = start,
+            EndTicks = end,
+            RuntimeTicks = 50_000_000_000,
+            Canonical = new CanonicalAnchor { SourceItemId = item, StartTicks = start, EndTicks = end },
+            AnchorId = $"{item:N}:{start}:{end}",
+            Vector = vector
+        };
     }
 
     private static double[] Axis(int index)
@@ -391,6 +642,19 @@ public class SimilarSegmentTests
             }
 
             return row;
+        }
+
+        public void Adopt(IReadOnlyList<CandidateRow> rows) => Joint.Candidates = rows.ToArray();
+
+        public void Persist(Guid item, string source, Guid library, string version)
+        {
+            if (!_media.Add((item, source)))
+            {
+                return;
+            }
+
+            Fixture.Allow.Add(item);
+            Fixture.Store.SaveSucceededWindow(item, source, library, version, 50_000_000_000, 0, 12_000_000, CoreTests.Axis(0), null);
         }
 
         public void Save() => Write(validate: true);

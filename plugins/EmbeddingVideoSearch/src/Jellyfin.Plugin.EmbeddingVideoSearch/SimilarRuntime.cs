@@ -19,7 +19,9 @@ public sealed partial class SearchRuntime
 
         RequireBindingStamp(request.ExpectedBindingVersion);
         var limit = ResolveSimilarLimit(request.GroupByVideo, request.Limit);
+        cancellationToken.ThrowIfCancellationRequested();
         var snapshot = ReadCandidatesOrIncompatible();
+        cancellationToken.ThrowIfCancellationRequested();
         var located = FindCandidate(snapshot, request.SegmentId);
         if (located is null)
         {
@@ -28,14 +30,15 @@ public sealed partial class SearchRuntime
 
         var selection = SelectLibraries(principal, new SearchRequest { ParentId = request.ParentId });
         var referenceRow = located.Value.Row;
-        if (!SourceVisible(principal, selection, referenceRow))
+        var probe = new SourceProbe(this, principal, selection, cancellationToken);
+        if (!probe.Visible(referenceRow))
         {
             throw NotFound();
         }
 
         var signature = _store.ActiveSignature();
         RequireCompatible(snapshot, signature);
-        if (!SourceCurrent(referenceRow, selection.Libraries))
+        if (!probe.Current(referenceRow))
         {
             throw Stale();
         }
@@ -56,11 +59,13 @@ public sealed partial class SearchRuntime
 
         cancellationToken.ThrowIfCancellationRequested();
         var generation = signature!.Generation;
-        var ranked = RankJoint(joint, referenceRow, source, principal, selection);
+        var ranked = RankJoint(joint, referenceRow, source, probe, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
 
         principal = RequirePrincipal(userId);
+        cancellationToken.ThrowIfCancellationRequested();
         var fresh = ReadCandidatesOrIncompatible();
+        cancellationToken.ThrowIfCancellationRequested();
         var active = _store.ActiveSignature();
         if (active is null || active.Generation != generation || fresh.Identity != snapshot.Identity)
         {
@@ -69,13 +74,14 @@ public sealed partial class SearchRuntime
 
         RequireCompatible(fresh, active);
         selection = SelectLibraries(principal, new SearchRequest { ParentId = request.ParentId });
+        var freshProbe = new SourceProbe(this, principal, selection, cancellationToken);
         var freshReference = FindCandidate(fresh, request.SegmentId);
-        if (freshReference is null || !SourceVisible(principal, selection, freshReference.Value.Row))
+        if (freshReference is null || !freshProbe.Visible(freshReference.Value.Row))
         {
             throw NotFound();
         }
 
-        if (!SourceCurrent(freshReference.Value.Row, selection.Libraries))
+        if (!freshProbe.Current(freshReference.Value.Row))
         {
             throw Stale();
         }
@@ -99,15 +105,26 @@ public sealed partial class SearchRuntime
             throw Incompatible();
         }
 
-        var allowed = freshJoint.Candidates
-            .Where(row => !JointSource.Excluded(row, freshReference.Value.Row, freshSource))
-            .Where(row => SourceVisible(principal, selection, row) && SourceCurrent(row, selection.Libraries))
-            .Select(row => row.SegmentId)
-            .ToHashSet();
+        var allowed = new HashSet<Guid>();
+        foreach (var row in freshJoint.Candidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (JointSource.Excluded(row, freshReference.Value.Row, freshSource))
+            {
+                continue;
+            }
+
+            if (freshProbe.Visible(row) && freshProbe.Current(row))
+            {
+                allowed.Add(row.SegmentId);
+            }
+        }
+
         ranked.RemoveAll(hit => !allowed.Contains(hit.SegmentId));
         var selected = request.GroupByVideo
             ? CandidateRanking.TakeByVideo(ranked, limit, ApiV1.GroupedHitsPerVideo)
             : ranked.Take(limit).ToList();
+        ApplyPageCoverage(selected, cancellationToken);
         if (request.CollapseRuns)
         {
             selected = RunCollapse.Apply(selected, fresh);
@@ -153,12 +170,13 @@ public sealed partial class SearchRuntime
     }
 
     private List<SearchHit> RankJoint(CandidateRepresentation joint, CandidateRow reference, CandidateRow source,
-        MediaPrincipal principal, (List<Guid> Libraries, Guid? Container) selection)
+        SourceProbe probe, CancellationToken cancellationToken)
     {
         var hits = new List<SearchHit>();
         foreach (var row in joint.Candidates)
         {
-            if (JointSource.Excluded(row, reference, source) || !SourceVisible(principal, selection, row) || !SourceCurrent(row, selection.Libraries))
+            cancellationToken.ThrowIfCancellationRequested();
+            if (JointSource.Excluded(row, reference, source) || !probe.Visible(row) || !probe.Current(row))
             {
                 continue;
             }
@@ -202,8 +220,94 @@ public sealed partial class SearchRuntime
             var byAnchor = string.Compare(left.AnchorId, right.AnchorId, StringComparison.Ordinal);
             return byAnchor != 0 ? byAnchor : left.SegmentId.CompareTo(right.SegmentId);
         });
-        ApplyStoredCoverage(hits);
         return hits;
+    }
+
+    private void ApplyPageCoverage(IReadOnlyList<SearchHit> hits, CancellationToken cancellationToken)
+    {
+        var complete = new Dictionary<(Guid Item, string Source), bool>();
+        foreach (var hit in hits)
+        {
+            var key = (hit.ItemId, hit.MediaSourceId);
+            if (!complete.TryGetValue(key, out var ready))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ready = _store.ReadMediaState(hit.ItemId, hit.MediaSourceId) == "complete";
+                cancellationToken.ThrowIfCancellationRequested();
+                complete[key] = ready;
+            }
+
+            hit.IndexComplete = ready;
+        }
+    }
+
+    /// <summary>
+    /// Remembers one pass only. Publication builds another probe, so an allow from ranking cannot hide a later revocation.
+    /// The key includes the content version and the library so two sources, or two versions of one source, cannot share a verdict.
+    /// </summary>
+    private sealed class SourceProbe
+    {
+        private readonly SearchRuntime _runtime;
+        private readonly MediaPrincipal _principal;
+        private readonly (List<Guid> Libraries, Guid? Container) _selection;
+        private readonly CancellationToken _cancellation;
+        private readonly Dictionary<(Guid Item, string Source, Guid Library, string Version), Verdict> _verdicts = new();
+
+        public SourceProbe(SearchRuntime runtime, MediaPrincipal principal, (List<Guid> Libraries, Guid? Container) selection, CancellationToken cancellation)
+        {
+            _runtime = runtime;
+            _principal = principal;
+            _selection = selection;
+            _cancellation = cancellation;
+        }
+
+        public bool Visible(CandidateRow row)
+        {
+            _cancellation.ThrowIfCancellationRequested();
+            return Resolve(row).Visible;
+        }
+
+        public bool Current(CandidateRow row)
+        {
+            _cancellation.ThrowIfCancellationRequested();
+            var verdict = Resolve(row);
+            if (!verdict.Visible || verdict.CurrentKnown)
+            {
+                return verdict.Visible && verdict.Current;
+            }
+
+            _cancellation.ThrowIfCancellationRequested();
+            var stored = _runtime._store.ReadStoredContentVersion(row.ItemId, row.MediaSourceId);
+            _cancellation.ThrowIfCancellationRequested();
+            var current = stored == row.ContentVersion
+                && _runtime.FactsMatch(row.ItemId, row.MediaSourceId, row.ContentVersion, _selection.Libraries);
+            _cancellation.ThrowIfCancellationRequested();
+            verdict.Current = current;
+            verdict.CurrentKnown = true;
+            return verdict.Current;
+        }
+
+        private Verdict Resolve(CandidateRow row)
+        {
+            var key = (row.ItemId, row.MediaSourceId, row.LibraryId, row.ContentVersion);
+            if (_verdicts.TryGetValue(key, out var verdict))
+            {
+                return verdict;
+            }
+
+            _cancellation.ThrowIfCancellationRequested();
+            verdict = new Verdict { Visible = _runtime.SourceVisible(_principal, _selection, row) };
+            _cancellation.ThrowIfCancellationRequested();
+            _verdicts[key] = verdict;
+            return verdict;
+        }
+
+        private sealed class Verdict
+        {
+            public bool Visible { get; init; }
+            public bool CurrentKnown { get; set; }
+            public bool Current { get; set; }
+        }
     }
 
     private CandidateSnapshot ReadCandidatesOrIncompatible()

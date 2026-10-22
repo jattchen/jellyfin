@@ -506,6 +506,7 @@ internal sealed class Fixture : IDisposable
     public HashSet<Guid> Containers { get; } = [];
     public HashSet<(Guid ItemId, Guid ParentId)> Parents { get; } = [];
     public Action<Guid, string>? OnReadFacts { get; set; }
+    public int AccessChecks { get; set; }
     public bool Disabled { get; set; }
     public TaskCompletionSource<bool>? EmbedRelease { get; set; }
     public TaskCompletionSource<bool>? EmbedEntered { get; set; }
@@ -567,7 +568,11 @@ internal sealed class FakeAccess : IMediaAccess
             return false;
         }
 
-        principal = new MediaPrincipal(true, Owner.Disabled, _ => true, (itemId, _) => Owner.Allow.Contains(itemId));
+        principal = new MediaPrincipal(true, Owner.Disabled, _ => true, (itemId, _) =>
+        {
+            Owner.AccessChecks++;
+            return Owner.Allow.Contains(itemId);
+        });
         return true;
     }
 }
