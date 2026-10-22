@@ -8,6 +8,9 @@ or start a service.
 
 Omit transcription_language_policy to keep forced Chinese. Set it to auto-v1
 to detect one language per audio chunk. Empty successful text skips alignment.
+An unsupported aligner language still stops unless the run explicitly sets
+unsupported_align_language_policy to unsupported-align-language-skip-v1.
+That skip keeps the original text as a gap and is not an alignment.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ TIMESTAMP_TOLERANCE_SECONDS = 0.001
 TAIL_TIME_POLICY = "last-unit-tail-80ms-v1"
 ALIGNER_REVISION = "53c8c0e46733eec430e4b53dd6471d0e5dee45f8"
 AUTO_LANGUAGE_POLICY = "auto-v1"
+UNSUPPORTED_ALIGN_SKIP_POLICY = "unsupported-align-language-skip-v1"
 # Allowlists copied from the installed model config support_languages.
 # ASR 30: qwen3-asr-1.7b e1f6c266914abc5a46e8756e02580f834a6cf8a7
 # Aligner 11: qwen3-forced-aligner-0.6b 53c8c0e46733eec430e4b53dd6471d0e5dee45f8
@@ -281,6 +285,37 @@ def align_route(record, policy):
             return None, "language-unsupported"
         return None, "language-unknown"
     return name, None
+
+
+def unsupported_align_policy(protocol):
+    value = (protocol or {}).get("unsupported_align_language_policy", None)
+    if value in (None, ""):
+        return None
+    if value == UNSUPPORTED_ALIGN_SKIP_POLICY:
+        return value
+    raise StageBlocked(f"未知对齐语言跳过策略：{value}")
+
+
+def unsupported_align_skip_applies(record, protocol):
+    """Substantive text the ASR accepts and this aligner does not."""
+    if unsupported_align_policy(protocol) != UNSUPPORTED_ALIGN_SKIP_POLICY:
+        return False
+    if language_policy(protocol) != AUTO_LANGUAGE_POLICY:
+        return False
+    _routed, error = align_route(record, AUTO_LANGUAGE_POLICY)
+    return error == "language-unsupported"
+
+
+def is_unsupported_skip_task(task, protocol):
+    if unsupported_align_policy(protocol) != UNSUPPORTED_ALIGN_SKIP_POLICY:
+        return False
+    return (
+        isinstance(task, dict)
+        and task.get("status") == "skipped"
+        and task.get("reason") == "language-unsupported"
+        and task.get("skip_policy") == UNSUPPORTED_ALIGN_SKIP_POLICY
+        and task.get("alignment_executed") is False
+    )
 
 
 def parse_peak_rss(stderr):
@@ -1037,11 +1072,38 @@ def reuse_succeeded(task, identity, output):
     return load_json(output)
 
 
-def reject_if_blocked(tasks):
-    blocker = blocking_task(tasks)
-    if blocker is not None:
+def reuse_unsupported_skip(task, identity, output, text, asr_record):
+    """Reuse a recorded language gap. Do not treat it as alignment or empty text."""
+    if task.get("identity") != identity:
+        raise StageBlocked(f"{task['chunk_id']} 的语言跳过与当前输入不一致，未自动改写")
+    if not output.is_file() or file_sha256(output) != task.get("output_sha256"):
+        raise StageBlocked(f"{task['chunk_id']} 的语言跳过输出哈希不一致，未自动改写")
+    record = load_json(output)
+    detected = asr_record.get("language_detected")
+    if (
+        record.get("alignment_executed") is not False
+        or record.get("skipped") is not True
+        or record.get("skip_reason") != "language-unsupported"
+        or record.get("skip_policy") != UNSUPPORTED_ALIGN_SKIP_POLICY
+        or record.get("input_text") != text
+        or record.get("units") != []
+        or record.get("detected_language") != detected
+        or record.get("language") != detected
+    ):
+        raise StageBlocked(f"{task['chunk_id']} 的语言跳过记录不完整，未当成对齐成功")
+    if record.get("language") == "Chinese" and detected != "Chinese":
+        raise StageBlocked(f"{task['chunk_id']} 的语言跳过被改写成中文")
+    return record
+
+
+def reject_if_blocked(tasks, allow=None):
+    for task in tasks:
+        if task.get("status") == "succeeded":
+            continue
+        if allow is not None and allow(task):
+            continue
         raise StageBlocked(
-            f"{blocker.get('chunk_id')} 检查点为 {blocker.get('status')}（{blocker.get('reason')}），未自动重试"
+            f"{task.get('chunk_id')} 检查点为 {task.get('status')}（{task.get('reason')}），未自动重试"
         )
 
 
@@ -1218,6 +1280,35 @@ def asr_text_for_chunk(run, chunk):
     return text, file_sha256(path)
 
 
+def write_unsupported_align_skip(path, asr_sha, text, detected, sample_count, derived_from=None):
+    """Keep the ASR text and record a skip. This is not an alignment and not an empty transcript."""
+    body = {
+        "asr_raw_sha256": asr_sha,
+        "input_text": text,
+        "input_text_sha256": text_sha256(text),
+        "language": detected,
+        "detected_language": detected,
+        "dtype": "bfloat16",
+        "backend": None,
+        "audio_samples": sample_count,
+        "audio_rate": SAMPLE_RATE,
+        "units": [],
+        "parser_capture": None,
+        "alignment_executed": False,
+        "asr_inference_executed": False,
+        "skipped": True,
+        "skip_reason": "language-unsupported",
+        "skip_policy": UNSUPPORTED_ALIGN_SKIP_POLICY,
+        "transcription_language_policy": AUTO_LANGUAGE_POLICY,
+        "language_granularity": "chunk",
+        "mlx_peak_allocated_bytes": None,
+    }
+    if derived_from is not None:
+        body["derived_from"] = derived_from
+    save_json(path, body)
+    return body
+
+
 def write_skip_alignment(path, asr_sha, text, reason, sample_count, language="Chinese", policy=None):
     save_json(
         path,
@@ -1259,7 +1350,8 @@ def stage_align(run, launch=None):
         if {task["chunk_id"] for task in asr_tasks if task.get("status") == "succeeded"} != {c["chunk_id"] for c in chunks}:
             raise StageBlocked("ASR 尚未全部成功，未开始对齐")
         tasks = load_tasks(run, "align")
-        reject_if_blocked(tasks)
+        unsupported_align_policy(protocol)
+        reject_if_blocked(tasks, allow=lambda task: is_unsupported_skip_task(task, protocol))
         for chunk in chunks:
             text, asr_sha = asr_text_for_chunk(run, chunk)
             asr_record = load_json(output_path(run, "asr", chunk["chunk_id"]))
@@ -1269,10 +1361,54 @@ def stage_align(run, launch=None):
             prior = find_task(tasks, chunk["chunk_id"])
             sample_count = int(chunk["end_sample"]) - int(chunk["start_sample"])
             if prior is not None:
+                if is_unsupported_skip_task(prior, protocol):
+                    if not unsupported_align_skip_applies(asr_record, protocol):
+                        raise StageBlocked(f"{chunk['chunk_id']} 的语言跳过与当前 ASR 不一致，未自动改写")
+                    reuse_unsupported_skip(prior, identity, destination, text, asr_record)
+                    print(f"align {chunk['chunk_id']} reuse language-unsupported", flush=True)
+                    continue
                 reuse_succeeded(prior, identity, destination)
                 print(f"align {chunk['chunk_id']} reuse", flush=True)
                 continue
             if route_error:
+                if unsupported_align_skip_applies(asr_record, protocol):
+                    if destination.exists():
+                        raise StageBlocked(f"{chunk['chunk_id']} 存在无检查点的对齐输出，未自动重跑")
+                    write_unsupported_align_skip(
+                        destination, asr_sha, text, asr_record.get("language_detected"), sample_count,
+                    )
+                    task = {
+                        "chunk_id": chunk["chunk_id"],
+                        "status": "skipped",
+                        "identity": identity,
+                        "reason": "language-unsupported",
+                        "skip_policy": UNSUPPORTED_ALIGN_SKIP_POLICY,
+                        "alignment_executed": False,
+                        "detected_language": asr_record.get("language_detected"),
+                        "elapsed_seconds": 0,
+                        "peak_rss_bytes": None,
+                        "mlx_peak_allocated_bytes": None,
+                        "output_sha256": file_sha256(destination),
+                        "text_sha256": text_sha256(text),
+                    }
+                    tasks.append(task)
+                    record_task(run, "align", tasks)
+                    record_metric(
+                        run,
+                        "align",
+                        {
+                            "stage": "align",
+                            "chunk_id": chunk["chunk_id"],
+                            "status": "skipped",
+                            "reason": "language-unsupported",
+                            "elapsed_seconds": 0,
+                            "peak_rss_bytes": None,
+                            "mlx_peak_allocated_bytes": None,
+                            "skipped_model": True,
+                        },
+                    )
+                    print(f"align {chunk['chunk_id']} skip language-unsupported", flush=True)
+                    continue
                 tasks.append({"chunk_id": chunk["chunk_id"], "status": "failed", "identity": identity,
                               "reason": route_error, "detected_language": asr_record.get("language_detected")})
                 record_task(run, "align", tasks)
@@ -1598,6 +1734,45 @@ def _provenance(
     }
 
 
+def language_gap_record(chunk, asr_text, align_record, asr_sha, align_sha):
+    """A substantive chunk the aligner cannot time. The text stays; it is not a candidate."""
+    detected = align_record.get("detected_language")
+    if align_record.get("input_text") != asr_text or not substantive(asr_text):
+        raise StageBlocked(f"{chunk['chunk_id']} 的语言缺口没有保住原文字")
+    if (
+        align_record.get("alignment_executed") is not False
+        or align_record.get("skipped") is not True
+        or align_record.get("skip_reason") != "language-unsupported"
+        or align_record.get("skip_policy") != UNSUPPORTED_ALIGN_SKIP_POLICY
+        or align_record.get("units") != []
+        or align_record.get("language") != detected
+        or detected in (None, "")
+    ):
+        raise StageBlocked(f"{chunk['chunk_id']} 的语言缺口不像一次明确跳过")
+    if align_record.get("language") == "Chinese" and detected != "Chinese":
+        raise StageBlocked(f"{chunk['chunk_id']} 的语言缺口被改写成中文")
+    if "start_ticks" not in chunk or "end_ticks" not in chunk:
+        raise StageBlocked(f"{chunk['chunk_id']} 缺少时间范围，不能记语言缺口")
+    return {
+        "chunk_id": chunk["chunk_id"],
+        "text": asr_text,
+        "start_ticks": int(chunk["start_ticks"]),
+        "end_ticks": int(chunk["end_ticks"]),
+        "reason": "language-unsupported",
+        "detected_language": detected,
+        "skip_policy": UNSUPPORTED_ALIGN_SKIP_POLICY,
+        "alignment_executed": False,
+        "embed": False,
+        "valid_utterance": False,
+        "text_retained": True,
+        "input_text_sha256": text_sha256(asr_text),
+        "asr_record": f"asr/{chunk['chunk_id']}.json",
+        "asr_raw_sha256": asr_sha,
+        "align_record": f"align/{chunk['chunk_id']}.json",
+        "align_raw_sha256": align_sha,
+    }
+
+
 def documents_identity(run, protocol, chunks):
     parts = [
         SEGMENTATION_VERSION,
@@ -1609,6 +1784,9 @@ def documents_identity(run, protocol, chunks):
         parts.append(language_policy(protocol))
     if protocol.get("alignment_time_policy"):
         parts.append(protocol["alignment_time_policy"])
+    skip_policy = unsupported_align_policy(protocol)
+    if skip_policy:
+        parts.append(skip_policy)
     for chunk in chunks:
         parts.append(chunk["chunk_id"])
         parts.append(chunk["wav_sha256"])
@@ -1624,34 +1802,60 @@ def stage_documents(run):
     try:
         protocol = load_protocol(run)
         chunks = load_chunks(run)
+        skip_policy = unsupported_align_policy(protocol)
         for stage in ("asr", "align"):
             tasks = load_tasks(run, stage)
-            reject_if_blocked(tasks)
-            if {task["chunk_id"] for task in tasks if task.get("status") == "succeeded"} != {c["chunk_id"] for c in chunks}:
+            if stage == "align":
+                reject_if_blocked(tasks, allow=lambda task: is_unsupported_skip_task(task, protocol))
+                settled = {
+                    task["chunk_id"]
+                    for task in tasks
+                    if task.get("status") == "succeeded" or is_unsupported_skip_task(task, protocol)
+                }
+            else:
+                reject_if_blocked(tasks)
+                settled = {task["chunk_id"] for task in tasks if task.get("status") == "succeeded"}
+            if settled != {c["chunk_id"] for c in chunks}:
                 raise StageBlocked(f"{stage} 尚未全部成功，未分段")
         identity = documents_identity(run, protocol, chunks)
         candidates_path = run / "candidates.json"
         retained_path = run / "non-substantive.json"
+        gaps_path = run / "align-language-gaps.json"
         if state_path.exists():
             state = load_json(state_path)
             if state.get("status") == "succeeded" and state.get("identity") == identity:
                 retained_ok = retained_path.is_file() and file_sha256(retained_path) == state.get("non_substantive_sha256")
-                if candidates_path.is_file() and file_sha256(candidates_path) == state.get("candidates_sha256") and retained_ok:
+                candidates_ok = candidates_path.is_file() and file_sha256(candidates_path) == state.get("candidates_sha256")
+                if skip_policy:
+                    gaps_ok = gaps_path.is_file() and file_sha256(gaps_path) == state.get("gaps_sha256")
+                elif gaps_path.exists():
+                    raise StageBlocked("没有跳过策略时不应存在语言缺口文件")
+                else:
+                    gaps_ok = True
+                if candidates_ok and retained_ok and gaps_ok:
                     print(f"documents reuse candidates={state.get('candidate_count')}", flush=True)
                     return load_json(candidates_path)
                 raise StageBlocked("分段检查点与 candidates.json 不一致，未重新改写")
             raise StageBlocked(f"分段检查点为 {state.get('status')}，未自动重试")
+        if gaps_path.exists():
+            raise StageBlocked("语言缺口文件没有分段检查点，未自动重跑")
         save_json(state_path, {"status": "started", "identity": identity})
         try:
             rows = []
             retained = []
+            gaps = []
             originals = []
+            align_tasks = {task["chunk_id"]: task for task in load_tasks(run, "align")}
             for chunk in chunks:
                 asr_text, asr_sha = asr_text_for_chunk(run, chunk)
                 originals.append(asr_text)
                 align_path = output_path(run, "align", chunk["chunk_id"])
                 align_record = load_json(align_path)
                 align_sha = file_sha256(align_path)
+                task = align_tasks.get(chunk["chunk_id"])
+                if is_unsupported_skip_task(task, protocol):
+                    gaps.append(language_gap_record(chunk, asr_text, align_record, asr_sha, align_sha))
+                    continue
                 kept = non_substantive_retention(chunk, asr_text, align_record, asr_sha, align_sha)
                 own = documents_for_chunk(chunk, protocol, asr_text, align_record, asr_sha, align_sha)
                 if kept is None:
@@ -1667,28 +1871,42 @@ def stage_documents(run):
                     retained.append(kept)
                 rows.extend(own)
             covered = []
+            gap_text = {gap["chunk_id"]: gap["text"] for gap in gaps}
             for chunk in chunks:
                 covered.extend(row["text"] for row in rows if row["provenance"]["chunk_id"] == chunk["chunk_id"])
                 covered.extend(row["text"] for row in retained if row["chunk_id"] == chunk["chunk_id"])
+                if chunk["chunk_id"] in gap_text:
+                    covered.append(gap_text[chunk["chunk_id"]])
             if "".join(covered) != "".join(originals):
-                raise StageBlocked("有效话语加非实质保留记录没有覆盖全部 ASR 原文")
+                raise StageBlocked("有效话语、非实质保留和语言缺口没有覆盖全部 ASR 原文")
             if any(not substantive(row["text"]) for row in rows):
                 raise StageBlocked("candidates.json 含标点或空白，不能送给文字 embedding")
+            if any(gap["chunk_id"] in {row["provenance"]["chunk_id"] for row in rows} for gap in gaps):
+                raise StageBlocked("语言缺口又生成了文字候选")
             save_json(candidates_path, rows)
             save_json(retained_path, retained)
-            save_json(
-                state_path,
-                {
-                    "status": "succeeded",
-                    "identity": identity,
-                    "candidate_count": len(rows),
-                    "candidates_sha256": file_sha256(candidates_path),
-                    "non_substantive_count": len(retained),
-                    "non_substantive_sha256": file_sha256(retained_path),
-                    "segmentation_version": SEGMENTATION_VERSION,
-                    "per_clip_document_cap": None,
-                },
-            )
+            if skip_policy:
+                save_json(gaps_path, gaps)
+            elif gaps:
+                raise StageBlocked("没有跳过策略时不能记录语言缺口")
+            state_body = {
+                "status": "succeeded",
+                "identity": identity,
+                "candidate_count": len(rows),
+                "candidates_sha256": file_sha256(candidates_path),
+                "non_substantive_count": len(retained),
+                "non_substantive_sha256": file_sha256(retained_path),
+                "segmentation_version": SEGMENTATION_VERSION,
+                "per_clip_document_cap": None,
+            }
+            if skip_policy:
+                state_body.update(
+                    unsupported_align_language_policy=skip_policy,
+                    text_coverage="gapped" if gaps else "full",
+                    gap_count=len(gaps),
+                    gaps_sha256=file_sha256(gaps_path),
+                )
+            save_json(state_path, state_body)
         except UnitBoundsRejected as exc:
             current = load_json(state_path) if state_path.exists() else {}
             if current.get("status") != "succeeded":
@@ -1702,7 +1920,7 @@ def stage_documents(run):
             if current.get("status") != "succeeded":
                 save_json(state_path, {"status": "failed", "identity": identity, "reason": str(exc)})
             raise
-        print(f"documents candidates={len(rows)} retained={len(retained)}", flush=True)
+        print(f"documents candidates={len(rows)} retained={len(retained)} gaps={len(gaps)}", flush=True)
         return rows
     finally:
         release_lock(lock)
