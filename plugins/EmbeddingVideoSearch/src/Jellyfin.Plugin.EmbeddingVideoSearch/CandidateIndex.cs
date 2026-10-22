@@ -144,6 +144,16 @@ public static class CandidateRanking
         return Sum(query.Select((v, i) => (double)v * document[i]));
     }
 
+    public static double Dot(double[] query, double[] document)
+    {
+        if (query.Length != ApiV1.Dimension || document.Length != query.Length)
+        {
+            throw new InvalidDataException("Candidate dimension mismatch.");
+        }
+
+        return Sum(query.Select((value, index) => value * document[index]));
+    }
+
     public static double ReferenceScore(double similarity, CandidateRepresentation representation)
     {
         if (!double.IsFinite(similarity))
@@ -263,6 +273,7 @@ public sealed partial class IndexStore
     {
         lock (_gate)
         {
+            CandidateSnapshotReads++;
             using var exists = _connection.CreateCommand();
             exists.CommandText = "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_representations'";
             if (Convert.ToInt32(exists.ExecuteScalar()) == 0)

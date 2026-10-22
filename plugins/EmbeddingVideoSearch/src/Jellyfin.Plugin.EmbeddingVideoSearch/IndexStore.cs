@@ -52,6 +52,9 @@ public sealed partial class IndexStore : IDisposable
     private readonly FileStream? _writerLock;
     private readonly string? _writerLockPath;
     private int _disposed;
+    internal int StoredContentVersionReads { get; private set; }
+    internal int MediaStateReads { get; private set; }
+    internal int CandidateSnapshotReads { get; private set; }
 
     private static readonly object ProcessLocks = new();
     private static readonly HashSet<string> HeldLocks = new(StringComparer.Ordinal);
@@ -134,6 +137,7 @@ public sealed partial class IndexStore : IDisposable
     {
         lock (_gate)
         {
+            StoredContentVersionReads++;
             using var command = _connection.CreateCommand();
             command.CommandText = """
                 SELECT content_version FROM media
@@ -152,6 +156,7 @@ public sealed partial class IndexStore : IDisposable
     {
         lock (_gate)
         {
+            MediaStateReads++;
             using var command = _connection.CreateCommand();
             command.CommandText = """
                 SELECT state FROM media

@@ -200,4 +200,26 @@ public static class JointSource
         var joint = snapshot.Representations.FirstOrDefault(candidateRepresentation => candidateRepresentation.Channel == "joint");
         return Select(row, representation ?? "", joint) is not null;
     }
+
+    public static bool Excluded(CandidateRow row, CandidateRow reference, CandidateRow source)
+    {
+        if (row.SegmentId == reference.SegmentId || row.SegmentId == source.SegmentId)
+        {
+            return true;
+        }
+
+        if (row.ItemId != source.ItemId
+            || row.MediaSourceId != source.MediaSourceId
+            || row.ContentVersion != source.ContentVersion)
+        {
+            return false;
+        }
+
+        var start = Math.Min(reference.StartTicks, source.StartTicks);
+        var end = Math.Max(reference.EndTicks, source.EndTicks);
+        return row.StartTicks <= end && start <= row.EndTicks;
+    }
+
+    public static (long StartTicks, long EndTicks) ExcludedSpan(CandidateRow reference, CandidateRow source)
+        => (Math.Min(reference.StartTicks, source.StartTicks), Math.Max(reference.EndTicks, source.EndTicks));
 }

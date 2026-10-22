@@ -551,3 +551,111 @@ public sealed class RebuildResponse
     [JsonPropertyName("status")]
     public AdminStatusResponse Status { get; set; } = new();
 }
+
+public sealed class SimilarRequest
+{
+    [JsonPropertyName("segmentId")]
+    public Guid SegmentId { get; set; }
+
+    [JsonPropertyName("expectedBindingVersion")]
+    public string? ExpectedBindingVersion { get; set; }
+
+    [JsonPropertyName("parentId")]
+    public Guid? ParentId { get; set; }
+
+    [JsonPropertyName("limit")]
+    public int? Limit { get; set; }
+
+    [JsonPropertyName("groupByVideo")]
+    public bool GroupByVideo { get; set; }
+
+    [JsonPropertyName("collapseRuns")]
+    public bool CollapseRuns { get; set; }
+
+    [JsonPropertyName("clientQueryId")]
+    public string? ClientQueryId { get; set; }
+}
+
+public sealed class SimilarResponse
+{
+    [JsonPropertyName("apiVersion")]
+    public string ApiVersion { get; set; } = ApiV1.Version;
+
+    [JsonPropertyName("queryId")]
+    public Guid QueryId { get; set; }
+
+    [JsonPropertyName("clientQueryId")]
+    public string? ClientQueryId { get; set; }
+
+    [JsonPropertyName("availability")]
+    public AvailabilityBody Availability { get; set; } = new();
+
+    [JsonPropertyName("indexComplete")]
+    public bool IndexComplete { get; set; }
+
+    [JsonPropertyName("qualityPolicy")]
+    public QualityPolicyBody QualityPolicy { get; set; } = new();
+
+    [JsonPropertyName("reference")]
+    public SimilarReferenceBody Reference { get; set; } = new();
+
+    [JsonPropertyName("results")]
+    public List<SearchHit> Results { get; set; } = [];
+}
+
+public sealed class SimilarReferenceBody
+{
+    [JsonPropertyName("segmentId")]
+    public Guid SegmentId { get; set; }
+
+    [JsonPropertyName("itemId")]
+    public Guid ItemId { get; set; }
+
+    [JsonPropertyName("mediaSourceId")]
+    public string MediaSourceId { get; set; } = "";
+
+    [JsonPropertyName("startTicks")]
+    public long StartTicks { get; set; }
+
+    [JsonPropertyName("endTicks")]
+    public long EndTicks { get; set; }
+
+    [JsonPropertyName("representation")]
+    public string Representation { get; set; } = "";
+
+    [JsonPropertyName("bindingVersion")]
+    public string BindingVersion { get; set; } = "";
+
+    [JsonPropertyName("source")]
+    public SimilarSourceBody Source { get; set; } = new();
+
+    [JsonPropertyName("excluded")]
+    public SimilarSpanBody Excluded { get; set; } = new();
+}
+
+public sealed class SimilarSourceBody
+{
+    [JsonPropertyName("segmentId")]
+    public Guid SegmentId { get; set; }
+
+    [JsonPropertyName("startTicks")]
+    public long StartTicks { get; set; }
+
+    [JsonPropertyName("endTicks")]
+    public long EndTicks { get; set; }
+
+    [JsonPropertyName("representation")]
+    public string Representation { get; set; } = "jointAudioVideo";
+
+    [JsonPropertyName("bindingVersion")]
+    public string BindingVersion { get; set; } = "";
+}
+
+public sealed class SimilarSpanBody
+{
+    [JsonPropertyName("startTicks")]
+    public long StartTicks { get; set; }
+
+    [JsonPropertyName("endTicks")]
+    public long EndTicks { get; set; }
+}
