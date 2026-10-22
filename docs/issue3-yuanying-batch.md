@@ -18,9 +18,11 @@
 
 一部片的覆盖记为 full，必须同时满足：准备、转写、对齐、分段、音画和文字都成功，而且窗口从 0 盖到这部片的真实结尾。每扇窗口都是完整的 12 秒，不能截短。摘录或只做完一部分，仍记为未完成。
 
-音画和文字分开记。`audioVisualCoverage` 为 full，表示窗口盖住整条时间线，而且每一扇音画向量都成功。`textCoverage` 为 full，表示没有语言缺口。出现上面那种允许的跳过时，`textCoverage` 为 gapped，整片 `coverage` 不是 full。缺口记录在该片的 `asr/align-language-gaps.json`：片号、块号、起止时间、原因、检测到的语言、策略版本，以及原文还在。进度里的公开缺口不含原文。有缺口就不能把文字说成完整，也不能导入。
+音画和文字分开记。`audioVisualCoverage` 为 full，表示窗口盖住整条时间线，而且每一扇音画向量都成功。`textCoverage` 为 full，表示没有语言缺口。出现上面那种允许的跳过时，`textCoverage` 为 gapped，整片 `coverage` 不是 full。缺口记录在该片的 `asr/align-language-gaps.json`：片号、块号、起止时间、原因、检测到的语言、策略版本，以及原文还在。进度里的公开缺口不含原文。有缺口时，文字覆盖保持 gapped。跳过的那一段不是空文本，也不是对齐成功。
 
-默认导入要求清单里的每一部都是 full。少一部就完全不写索引。加上 `--allow-partial` 时，只把已经 full 的写入新索引，命令以非 0 结束，整批覆盖记为 partial，不能把整个目录说成已经完成。
+默认导入要求清单里的每一部都是 full。有文字缺口时整批拒绝，不写索引。少一部也完全不写索引。加上 `--allow-partial` 时，只把已经 full 的写入新索引，命令以非 0 结束。证据写明清单片数、实际导入片数和被跳过的片号。被跳过的片子不计入已导入片数，整批覆盖记为 partial。
+
+只有导入配置显式写了 `languageGapImportPolicy`，而且值正好是 `approved-language-gap-import-v1` 时，已经按 `unsupported-align-language-skip-v1` 跳过的语言缺口才可以和全部音画窗口、其余有效文字一起进入新索引。证据里的 `textGaps` 照实写下片号、块号、起止时间、原因、检测到的语言、跳过策略、`alignment_executed: false` 和原文哈希。原文本身不进证据，也不进索引。整批 `coverage` 记为 gapped，`fullFilm` 为 false，命令以退出码 2 结束。这条策略不改索引里的表，媒体行仍是 `complete`，表示音画窗口可以搜索。运行中的检索覆盖标记看不到这个文字缺口，要以导入证据为准。未知状态、没有批准的语言、缺文件、坏向量、签名不符，或同一批里还有第二种实际错误，都整批拒绝，不留下半个索引。这条策略打开时，`--allow-partial` 不能再丢掉失败的片子。
 
 ## 已有 120 秒样本
 
@@ -77,6 +79,7 @@
   "unsupportedAlignLanguagePolicy": "unsupported-align-language-skip-v1",
   "alignmentTimePolicy": "last-unit-tail-80ms-v1",
   "sourceSelectionPolicy": "frozen-facts-only-v1",
+  "languageGapImportPolicy": "approved-language-gap-import-v1",
   "recoverySource": "$OLD_OUTPUT",
   "recoverySnapshot": "$V2_SNAPSHOT",
   "storageInterruptionRecovery": {
@@ -99,6 +102,8 @@
 `unsupportedAlignLanguagePolicy` 可以不写。不写时保持严格停下。恢复时才写上面的版本值。`alignmentTimePolicy` 也可以不写。不写时，末字越界仍按失败停下。写了之后，只有新的、还没做完的转写协议会带上这条规则。已经做完的协议不会因为只改顶层配置而更新，所以要换一个新的输出目录。
 
 `sourceSelectionPolicy` 也可以不写。不写或写成空字符串时，目录里多出来的 mp4 会让准备不就绪。只有新的配置副本需要忽略这些文件时，才写成 `frozen-facts-only-v1`。已经准备好的输出不用因此重做协议。旧的失败配置保持原样。
+
+`languageGapImportPolicy` 也可以不写。不写或写成空字符串时，文字缺口不能导入。要把已批准的语言缺口连同全部音画和有效文字写入新索引时，才在这份导入配置里写成 `approved-language-gap-import-v1`。它不改已经完成的协议和缓存。未知字符串会在导入前拒绝。
 
 `recoverySource` 是旧输出目录，只读。`recoverySnapshot` 是这份旧输出的文件清单，每一项有路径、大小和 sha256。恢复前先核对清单和磁盘一致。新的 `outputRoot` 必须是另一个还不存在的目录。它可以和旧目录不在同一块盘上。
 
@@ -202,7 +207,7 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$REC
 
 屏幕上的进度只显示 `F001` 这类编号、覆盖状态和数量，不显示路径、原文、向量或令牌。带路径的清单留在输出目录的私有文件里。
 
-`run` 和 `resume` 的退出码：0 表示每一部都是 full。1 表示准备未就绪，例如模型目录不完整。2 表示普通阶段失败、还有未完成的片，或已完成的片里仍有文字缺口。3 表示停在未知、超时或被打断的推理上。普通失败、未知和超时都会停住整批，不会继续下一部，也不会把未完成的结果写成 full。已经按规则跳过语言、并且音画已经完整的片，不会挡住下一部；这种批次退出 2，进度里有缺口，但没有 `stopped`。只跑 `--film` 时，没被点名的片保持原状态，整批因此也不是 0。`--film F011` 时如果这一部没有硬失败，退出码也是 2，进度里没有 `stopped`。其余片都跑完以后，只要还留着文字缺口，退出码仍是 2，覆盖是 gapped，没有 `stopped`。退出码 2 并且进度里有 `stopped`，才是真的失败把整批停住。有文字缺口的片不导入。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
+`run` 和 `resume` 的退出码：0 表示每一部都是 full。1 表示准备未就绪，例如模型目录不完整。2 表示普通阶段失败、还有未完成的片，或已完成的片里仍有文字缺口。3 表示停在未知、超时或被打断的推理上。普通失败、未知和超时都会停住整批，不会继续下一部，也不会把未完成的结果写成 full。已经按规则跳过语言、并且音画已经完整的片，不会挡住下一部；这种批次退出 2，进度里有缺口，但没有 `stopped`。只跑 `--film` 时，没被点名的片保持原状态，整批因此也不是 0。`--film F011` 时如果这一部没有硬失败，退出码也是 2，进度里没有 `stopped`。其余片都跑完以后，只要还留着文字缺口，退出码仍是 2，覆盖是 gapped，没有 `stopped`。退出码 2 并且进度里有 `stopped`，才是真的失败把整批停住。有文字缺口的片，默认导入会整批拒绝。只有导入配置显式写成 `approved-language-gap-import-v1` 时，才按上文规则写入新索引，整批仍记为 gapped。每一阶段的日志写在该片已有的 `logs` 目录里，后一阶段继续使用这个目录。
 
 导入产物是新目录里的 `prepared-index.db`。它保持 `manual_pause=1`、`imported_candidates_only=1` 和 `http://127.0.0.1:18784`。完成的片在索引里是 `complete`。不要打开正在运行的 `index.db`，也不要把 10 秒签名写进去。
 

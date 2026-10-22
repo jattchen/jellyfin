@@ -1699,5 +1699,332 @@ class FrozenSourceSelection(unittest.TestCase):
             self.assertFalse(output.exists())
 
 
+class ApprovedLanguageGapImport(unittest.TestCase):
+    def prepare(self, root, count):
+        output = root / "output"
+        rows = [
+            source_file(
+                root / "media", f"film-F{index:03d}.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label=f"F{index:03d}",
+            )
+            for index in range(1, count + 1)
+        ]
+        config = config_for(root, rows, output)
+        batch.preflight(config)
+        config["template"] = str(root / "empty.template.db")
+        template(config["template"])
+        config["references"] = str(references(root))
+        return output, config
+
+    def settle_approved_gap(self, output):
+        film = output / "films" / "F001"
+        protocol = batch.read_json(film / "asr" / "protocol.json")
+        protocol["unsupported_align_language_policy"] = batch.UNSUPPORTED_ALIGN_SKIP_POLICY
+        batch.write_json(film / "asr" / "protocol.json", protocol)
+        text = {
+            "candidate_id": "c0000-U01", "text": "合成句",
+            "start_ticks": 0, "end_ticks": 1_000_000, "full_film": True,
+        }
+        batch.write_json(film / "asr" / "prepare.json", {"status": "succeeded"})
+        batch.write_json(film / "asr" / "chunks.json", [{"chunk_id": "c0000"}, {"chunk_id": "c0273"}])
+        batch.write_json(film / "asr" / "asr-tasks.json", [
+            {"chunk_id": "c0000", "status": "succeeded"},
+            {"chunk_id": "c0273", "status": "succeeded"},
+        ])
+        batch.write_json(film / "asr" / "align-tasks.json", [
+            {"chunk_id": "c0000", "status": "succeeded"},
+            {
+                "chunk_id": "c0273", "status": "skipped", "reason": "language-unsupported",
+                "skip_policy": batch.UNSUPPORTED_ALIGN_SKIP_POLICY, "alignment_executed": False,
+                "detected_language": "Dutch",
+            },
+        ])
+        batch.write_json(film / "asr" / "documents-state.json", {
+            "status": "succeeded", "text_coverage": "gapped", "gap_count": 1,
+        })
+        batch.write_json(film / "asr" / "candidates.json", [text])
+        batch.write_json(film / "asr" / "align-language-gaps.json", [{
+            "chunk_id": "c0273", "text": "PRIVATE_GAP_TEXT",
+            "start_ticks": 2_000_000, "end_ticks": 3_000_000,
+            "reason": "language-unsupported", "detected_language": "Dutch",
+            "skip_policy": batch.UNSUPPORTED_ALIGN_SKIP_POLICY, "alignment_executed": False,
+            "embed": False, "text_retained": True,
+            "input_text_sha256": "c116855b877d5732d60f2961a6aea36d098c04cc3677be05cacbc111670ebe8a",
+        }])
+        batch.publish_transcription(film / "asr", film / "embed")
+        embed_protocol = batch.read_json(film / "embed" / "protocol.json")
+        for entry in embed_protocol["joint_windows"]:
+            write_embedding(film / "embed", "joint", entry, embed_protocol, joint_processing(), unit(0))
+        write_embedding(film / "embed", "text", text, embed_protocol, document_processing(), unit(1))
+        return film, text
+
+    def test_default_refuses_and_approved_policy_imports_every_film(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, config = self.prepare(root, 3)
+            film, text = self.settle_approved_gap(output)
+            finish_embeddings(output / "films" / "F002", [dict(text, candidate_id="c0000-U02")])
+            finish_embeddings(output / "films" / "F003", [])
+            assessed = batch.assess_film(film)
+            self.assertEqual(assessed["coverage"], "gapped")
+            self.assertFalse(assessed["successfulEmpty"])
+            self.assertNotIn("text", assessed["gaps"][0])
+            refused = root / "refused-index"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.import_films(output, config["template"], config["references"], refused)
+            self.assertEqual(caught.exception.reason, "coverage-incomplete")
+            self.assertFalse(refused.exists())
+            config["languageGapImportPolicy"] = ""
+            with self.assertRaises(batch.BatchBlocked):
+                batch.import_films(
+                    output, config["template"], config["references"], root / "empty-policy",
+                    allow_language_gaps=False,
+                )
+            self.assertFalse((root / "empty-policy").exists())
+            config["languageGapImportPolicy"] = "approve-every-language"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.require_config(config)
+            self.assertEqual(caught.exception.reason, "config")
+            self.assertFalse((root / "unknown-policy").exists())
+            config["languageGapImportPolicy"] = batch.LANGUAGE_GAP_IMPORT_POLICY
+            batch.write_json(root / "config.json", config)
+            destination = root / "approved-index"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = batch.main(["import", "--config", str(root / "config.json"), "--output", str(destination)])
+            self.assertEqual(code, 2, stderr.getvalue())
+            evidence = json.loads(stdout.getvalue())
+            self.assertEqual(evidence["batchCoverage"], "gapped")
+            self.assertEqual(evidence["coverage"], "gapped")
+            self.assertFalse(evidence["fullFilm"])
+            self.assertEqual(evidence["languageGapImportPolicy"], batch.LANGUAGE_GAP_IMPORT_POLICY)
+            self.assertEqual(evidence["manifestFilmCount"], 3)
+            self.assertEqual(evidence["importedFilmCount"], 3)
+            self.assertEqual(evidence["omitted"], [])
+            self.assertEqual(evidence["textGappedFilms"], 1)
+            self.assertEqual(len(evidence["textGaps"]), 1)
+            gap = evidence["textGaps"][0]
+            self.assertEqual(gap["label"], "F001")
+            self.assertEqual(gap["chunk_id"], "c0273")
+            self.assertEqual(gap["start_ticks"], 2_000_000)
+            self.assertEqual(gap["end_ticks"], 3_000_000)
+            self.assertEqual(gap["reason"], "language-unsupported")
+            self.assertEqual(gap["detected_language"], "Dutch")
+            self.assertEqual(gap["skip_policy"], batch.UNSUPPORTED_ALIGN_SKIP_POLICY)
+            self.assertIs(gap["alignment_executed"], False)
+            self.assertIs(gap["text_retained"], True)
+            self.assertEqual(gap["input_text_sha256"], "c116855b877d5732d60f2961a6aea36d098c04cc3677be05cacbc111670ebe8a")
+            self.assertNotIn("text", gap)
+            self.assertNotIn("PRIVATE_GAP_TEXT", json.dumps(evidence))
+            by_label = {row["label"]: row for row in evidence["films"]}
+            self.assertEqual(by_label["F001"]["state"], "text-gapped")
+            self.assertEqual(by_label["F001"]["textCoverage"], "gapped")
+            self.assertFalse(by_label["F001"]["successfulEmpty"])
+            self.assertEqual(by_label["F001"]["documents"], 1)
+            self.assertEqual(by_label["F002"]["state"], "complete")
+            self.assertEqual(by_label["F002"]["textCoverage"], "full")
+            self.assertEqual(by_label["F002"]["documents"], 1)
+            self.assertEqual(by_label["F003"]["state"], "complete")
+            self.assertEqual(by_label["F003"]["textCoverage"], "full")
+            self.assertTrue(by_label["F003"]["successfulEmpty"])
+            self.assertEqual(by_label["F003"]["documents"], 0)
+            self.assertNotIn("gaps", by_label["F003"])
+            connection = sqlite3.connect(destination / "prepared-index.db")
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM media WHERE state='complete'").fetchone()[0], 3)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM windows WHERE state='succeeded'").fetchone()[0], 3)
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn("language_gaps", tables)
+            bundles = {row[0]: json.loads(row[1]) for row in connection.execute(
+                "SELECT channel, payload_json FROM candidate_representations")}
+            connection.close()
+            self.assertEqual(len(bundles["text"]["candidates"]), 2)
+            self.assertNotIn("PRIVATE_GAP_TEXT", json.dumps(bundles))
+            self.assertNotIn("input_text_sha256", json.dumps(bundles))
+            self.assertNotIn("language-unsupported", json.dumps(bundles))
+            item = batch.read_json(film / "embed" / "protocol.json")["source"]["itemId"]
+            prefix = "text-" + item.replace("-", "") + "-"
+            stored_ids = [row["candidateId"] for row in bundles["text"]["candidates"]]
+            self.assertTrue(any(candidate_id.startswith(prefix) for candidate_id in stored_ids))
+            joint_id = batch.read_json(film / "embed" / "protocol.json")["joint_windows"][0]["candidate_id"]
+            self.assertIn(joint_id, [row["candidateId"] for row in bundles["joint"]["candidates"]])
+            self.assertEqual(bundles["joint"]["processingId"], SIGNATURE["processing_id"])
+
+    def test_other_failures_leave_no_partial_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, config = self.prepare(root, 2)
+            film, _text = self.settle_approved_gap(output)
+            finish_embeddings(output / "films" / "F002", [])
+            kwargs = {"allow_language_gaps": True, "allow_partial": True}
+
+            def refuses(mutate, restore, reason):
+                mutate()
+                target = root / ("refuse-" + reason)
+                with self.assertRaises(batch.BatchBlocked) as caught:
+                    batch.import_films(output, config["template"], config["references"], target, **kwargs)
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertFalse(target.exists())
+                restore()
+
+            joint_entry = batch.read_json(film / "embed" / "protocol.json")["joint_windows"][0]
+            state_path = film / "embed" / "joint" / (joint_entry["candidate_id"] + ".state.json")
+            state_bytes = state_path.read_bytes()
+            response_path = film / "embed" / "joint" / (joint_entry["candidate_id"] + ".json")
+            response_bytes = response_path.read_bytes()
+
+            def unknown():
+                state = batch.read_json(state_path)
+                state["status"] = "unknown"
+                batch.write_json(state_path, state)
+
+            refuses(unknown, lambda: state_path.write_bytes(state_bytes), "not-succeeded")
+
+            gap_path = film / "asr" / "align-language-gaps.json"
+            gap_bytes = gap_path.read_bytes()
+            align_path = film / "asr" / "align-tasks.json"
+            align_bytes = align_path.read_bytes()
+
+            def unapproved_language():
+                gaps = batch.read_json(gap_path)
+                gaps[0]["reason"] = "mixed-language"
+                batch.write_json(gap_path, gaps)
+                tasks = batch.read_json(align_path)
+                tasks[1]["reason"] = "mixed-language"
+                batch.write_json(align_path, tasks)
+
+            refuses(
+                unapproved_language,
+                lambda: (gap_path.write_bytes(gap_bytes), align_path.write_bytes(align_bytes)),
+                "transcription-failed",
+            )
+
+            def missing_response():
+                response_path.unlink()
+
+            refuses(missing_response, lambda: response_path.write_bytes(response_bytes), "import-rejected")
+
+            def bad_vector():
+                body = batch.read_json(response_path)
+                body["data"][0]["embedding"] = [0.0] * 768
+                batch.write_json(response_path, body)
+                state = batch.read_json(state_path)
+                state["response_sha256"] = embed.sha(response_path)
+                batch.write_json(state_path, state)
+
+            refuses(
+                bad_vector,
+                lambda: (response_path.write_bytes(response_bytes), state_path.write_bytes(state_bytes)),
+                "import-rejected",
+            )
+
+            manifest_path = output / "manifest.json"
+            manifest_bytes = manifest_path.read_bytes()
+
+            def wrong_signature():
+                manifest = batch.read_json(manifest_path)
+                manifest["signature"] = dict(manifest["signature"], processing_id="eg2-ffffffffffffffff")
+                batch.write_json(manifest_path, manifest)
+
+            refuses(wrong_signature, lambda: manifest_path.write_bytes(manifest_bytes), "signature-mismatch")
+
+            second_align = output / "films" / "F002" / "asr" / "align-tasks.json"
+            second_bytes = second_align.read_bytes()
+
+            def second_failure():
+                batch.write_json(second_align, [{"chunk_id": "c0000", "status": "failed", "reason": "process"}])
+
+            refuses(second_failure, lambda: second_align.write_bytes(second_bytes), "transcription-failed")
+
+    def test_allow_partial_does_not_count_an_omitted_gap_as_imported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, config = self.prepare(root, 2)
+            self.settle_approved_gap(output)
+            finish_embeddings(output / "films" / "F002", [])
+            destination = root / "partial-index"
+            evidence = batch.import_films(
+                output, config["template"], config["references"], destination, allow_partial=True)
+            self.assertEqual(evidence["batchCoverage"], "partial")
+            self.assertEqual(evidence["coverage"], "partial")
+            self.assertFalse(evidence["fullFilm"])
+            self.assertEqual(evidence["manifestFilmCount"], 2)
+            self.assertEqual(evidence["importedFilmCount"], 1)
+            self.assertNotEqual(evidence["importedFilmCount"], evidence["manifestFilmCount"])
+            self.assertEqual(evidence["omitted"][0]["label"], "F001")
+            self.assertEqual(evidence["omitted"][0]["reason"], "coverage-incomplete")
+            self.assertEqual([row["label"] for row in evidence["films"]], ["F002"])
+            self.assertNotIn("textGaps", evidence)
+            connection = sqlite3.connect(destination / "prepared-index.db")
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM media").fetchone()[0], 1)
+            connection.close()
+
+    def test_gapless_import_keeps_the_old_rows_and_accepts_a_stored_audio_gap_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, config = self.prepare(root, 1)
+            film_dir = output / "films" / "F001"
+            text = {
+                "candidate_id": "c0000-U01", "text": "合成句",
+                "start_ticks": 0, "end_ticks": 1_000_000, "full_film": True,
+            }
+            finish_embeddings(film_dir, [text])
+            plain = root / "plain-index"
+            evidence = batch.import_films(output, config["template"], config["references"], plain)
+            self.assertEqual(evidence["batchCoverage"], "full")
+            self.assertEqual(evidence["coverage"], "full")
+            self.assertTrue(evidence["fullFilm"])
+            self.assertNotIn("textGaps", evidence)
+            self.assertNotIn("languageGapImportPolicy", evidence)
+            self.assertEqual(evidence["films"][0]["state"], "complete")
+            self.assertEqual(evidence["films"][0]["textCoverage"], "full")
+            connection = sqlite3.connect(plain / "prepared-index.db")
+            self.assertEqual(connection.execute("SELECT state FROM media").fetchone()[0], "complete")
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM windows WHERE state='succeeded'").fetchone()[0], 1)
+            self.assertEqual(connection.execute(
+                "SELECT window_version, processing_id FROM signatures").fetchone(),
+                (contract.VERSION, SIGNATURE["processing_id"]))
+            connection.close()
+            config["languageGapImportPolicy"] = batch.LANGUAGE_GAP_IMPORT_POLICY
+            still_full = root / "policy-without-gap"
+            again = batch.import_films(
+                output, config["template"], config["references"], still_full, allow_language_gaps=True)
+            self.assertEqual(again["batchCoverage"], "full")
+            self.assertTrue(again["fullFilm"])
+            self.assertEqual(again["importedFilmCount"], 1)
+
+            protocol = batch.read_json(film_dir / "embed" / "protocol.json")
+            entry = protocol["joint_windows"][0]
+            clip_path = film_dir / "embed" / "clips" / (entry["candidate_id"] + ".clip.json")
+            clip = batch.read_json(clip_path)
+            original_hash = batch.read_json(
+                film_dir / "embed" / "joint" / (entry["candidate_id"] + ".state.json"))["input_hash"]
+            clip["identity"].update({
+                "audio_gap_policy": contract.AUDIO_GAP_POLICY,
+                "audio_gap_total_seconds": "0.080000",
+                "audio_gap_count": 1,
+                "audio_gaps": [{"start_seconds": "0.256000", "end_seconds": "0.336000", "seconds": "0.080000"}],
+            })
+            batch.write_json(clip_path, clip)
+            stale = root / "stale-hash"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.import_films(output, config["template"], config["references"], stale)
+            self.assertEqual(caught.exception.reason, "cache-hash-mismatch")
+            self.assertFalse(stale.exists())
+            state_path = film_dir / "embed" / "joint" / (entry["candidate_id"] + ".state.json")
+            state = batch.read_json(state_path)
+            state["input_hash"] = batch.candidate_hash(
+                protocol, "joint", entry, clip["sha256"], batch.joint_audio_gap(film_dir / "embed", entry))
+            self.assertNotEqual(state["input_hash"], original_hash)
+            batch.write_json(state_path, state)
+            matched = root / "matched-hash"
+            imported = batch.import_films(output, config["template"], config["references"], matched)
+            self.assertEqual(imported["coverage"], "full")
+            connection = sqlite3.connect(matched / "prepared-index.db")
+            bundles = {row[0]: json.loads(row[1]) for row in connection.execute(
+                "SELECT channel, payload_json FROM candidate_representations")}
+            connection.close()
+            self.assertIn(entry["candidate_id"], [row["candidateId"] for row in bundles["joint"]["candidates"]])
+            self.assertNotIn("audio_gap_policy", json.dumps(bundles))
+
+
 if __name__ == "__main__":
     unittest.main()

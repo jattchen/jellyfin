@@ -31,6 +31,7 @@ LANGUAGE_POLICY = "auto-v1"
 UNSUPPORTED_ALIGN_SKIP_POLICY = "unsupported-align-language-skip-v1"
 ALIGNMENT_TIME_POLICY = "last-unit-tail-80ms-v1"
 SOURCE_SELECTION_POLICY = "frozen-facts-only-v1"
+LANGUAGE_GAP_IMPORT_POLICY = "approved-language-gap-import-v1"
 MODEL_CONCURRENCY = 1
 TRANSCRIBE_STAGES = ("prepare", "asr", "align", "documents")
 EMBED_STAGES = ("joint", "text")
@@ -240,6 +241,9 @@ def require_config(config):
     selection = config.get("sourceSelectionPolicy", None)
     if selection not in (None, "", SOURCE_SELECTION_POLICY):
         raise BatchBlocked("unknown source selection policy", reason="config")
+    gap_import = config.get("languageGapImportPolicy", None)
+    if gap_import not in (None, "", LANGUAGE_GAP_IMPORT_POLICY):
+        raise BatchBlocked("unknown language gap import policy", reason="config")
     for key in ("sourceDirectory", "sourceFacts", "outputRoot", "workerPython", "asrModel", "alignerModel"):
         if not config.get(key):
             raise BatchBlocked("config missing " + key, reason="config")
@@ -1507,12 +1511,106 @@ def run_batch(config, *, execute=None, send=None, only_labels=None):
     return 0, progress
 
 
-def load_film_rows(film_dir, root_signature):
+def approved_language_gap(gap, runtime):
+    """A public skip row. Original text stays out of this record."""
+    if not isinstance(gap, dict) or "text" in gap:
+        return False
+    start, end = gap.get("start_ticks"), gap.get("end_ticks")
+    if isinstance(start, bool) or isinstance(end, bool):
+        return False
+    if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= int(runtime):
+        return False
+    return (
+        gap.get("reason") == "language-unsupported"
+        and gap.get("skip_policy") == UNSUPPORTED_ALIGN_SKIP_POLICY
+        and gap.get("alignment_executed") is False
+        and gap.get("text_retained") is True
+        and isinstance(gap.get("chunk_id"), str) and gap["chunk_id"]
+        and isinstance(gap.get("detected_language"), str) and gap["detected_language"]
+        and isinstance(gap.get("input_text_sha256"), str) and gap["input_text_sha256"]
+        and isinstance(gap.get("label"), str) and gap["label"]
+    )
+
+
+def text_overlaps_gap(entry, gaps):
+    start, end = int(entry["start_ticks"]), int(entry["end_ticks"])
+    return any(start < int(gap["end_ticks"]) and int(gap["start_ticks"]) < end for gap in gaps)
+
+
+def verified_import_vector(embed_run, entry, protocol, channel):
+    """Check a stored vector. A joint clip with an audio-gap identity uses that hash."""
+    embed_run = Path(embed_run)
+    try:
+        gap = joint_audio_gap(embed_run, entry) if channel == "joint" else None
+    except contract.ContractError as exc:
+        raise BatchBlocked(
+            "cached input hash does not match this candidate", reason="cache-hash-mismatch", stage=channel,
+        ) from exc
+    if channel != "joint" or not gap:
+        try:
+            return film_import.verified_vector(embed_run, entry, protocol, channel)
+        except FileNotFoundError as exc:
+            raise BatchBlocked("embedding response is missing", reason="import-rejected", stage=channel) from exc
+        except (AssertionError, RuntimeError) as exc:
+            raise BatchBlocked("embedding response is not a valid vector", reason="import-rejected", stage=channel) from exc
+    response = embed_run / "joint" / (entry["candidate_id"] + ".json")
+    state_path = response.with_suffix(".state.json")
+    clip_path = embed_run / "clips" / (entry["candidate_id"] + ".mp4")
+    clip_meta = clip_path.with_suffix(".clip.json")
+    if not response.is_file() or not state_path.is_file() or not clip_path.is_file() or not clip_meta.is_file():
+        raise BatchBlocked("embedding response is missing", reason="import-rejected", stage="joint")
+    state = read_json(state_path)
+    if state.get("status") != "succeeded":
+        raise BatchBlocked(
+            "unresolved checkpoint; not sending again", reason="not-succeeded",
+            status=state.get("status"), stage="joint",
+        )
+    if embed.sha(response) != state.get("response_sha256"):
+        raise BatchBlocked("cached response does not match its hash", reason="cache-hash-mismatch", stage="joint")
+    clip_state = read_json(clip_meta)
+    if embed.sha(clip_path) != clip_state.get("sha256"):
+        raise BatchBlocked("clip bytes do not match the stored hash", reason="cache-hash-mismatch", stage="joint")
+    identity = clip_state.get("identity") or {}
+    if identity.get("source") != embed.source_facts(protocol["source"]):
+        raise BatchBlocked("clip source does not match the film", reason="source-mismatch", stage="joint")
+    if identity.get("start_ticks") != entry["start_ticks"] or identity.get("end_ticks") != entry["end_ticks"]:
+        raise BatchBlocked("clip bounds do not match the window", reason="coverage-incomplete", stage="joint")
+    expected = candidate_hash(protocol, "joint", entry, clip_state.get("sha256"), gap)
+    if state.get("input_hash") != expected:
+        raise BatchBlocked("cached input hash does not match this candidate", reason="cache-hash-mismatch", stage="joint")
+    _digest, window = embed.embedding_input(protocol, "joint", entry, clip_state.get("sha256"), gap)
+    try:
+        return film_import.f32(embed.validate_response(read_json(response), protocol["signature"], "joint", window))
+    except AssertionError as exc:
+        raise BatchBlocked("embedding response is not a valid vector", reason="import-rejected", stage="joint") from exc
+
+
+def load_film_rows(film_dir, root_signature, *, allow_language_gaps=False):
     assessed = assess_film(film_dir)
-    if assessed.get("textCoverage") == "gapped" or assessed.get("gaps"):
+    gaps = list(assessed.get("gaps") or [])
+    runtime = None
+    embed_protocol_path = Path(film_dir) / "embed" / "protocol.json"
+    if embed_protocol_path.is_file():
+        runtime = read_json(embed_protocol_path).get("source", {}).get("runtimeTicks")
+    approved = (
+        allow_language_gaps
+        and bool(gaps)
+        and runtime is not None
+        and assessed.get("coverage") == "gapped"
+        and assessed.get("fullFilm") is True
+        and assessed.get("audioVisualCoverage") == "full"
+        and assessed.get("textCoverage") == "gapped"
+        and assessed.get("successfulEmpty") is False
+        and assessed.get("blocked") is False
+        and all(approved_language_gap(gap, runtime) for gap in gaps)
+    )
+    if assessed.get("blocked") or assessed.get("coverage") not in {"full", "gapped"}:
+        raise BatchBlocked("film is not a completed whole-film coverage", reason=assessed["reason"] or "coverage-incomplete",
+                           status=assessed["status"], stage=assessed["stage"], label=Path(film_dir).name)
+    if gaps and not approved:
         raise BatchBlocked("a text gap is not complete coverage", reason="coverage-incomplete",
                            status=assessed["status"], stage=assessed["stage"], label=Path(film_dir).name)
-    if assessed["coverage"] != "full" or assessed["fullFilm"] is not True:
+    if not approved and (assessed["coverage"] != "full" or assessed["fullFilm"] is not True):
         raise BatchBlocked("film is not a completed whole-film coverage", reason=assessed["reason"] or "coverage-incomplete",
                            status=assessed["status"], stage=assessed["stage"], label=Path(film_dir).name)
     embed_run = Path(film_dir) / "embed"
@@ -1539,7 +1637,8 @@ def load_film_rows(film_dir, root_signature):
     rooted["signature"] = root_signature
     joint_rows = []
     for entry in protocol["joint_windows"]:
-        joint_rows.append(film_import.candidate_row(entry, protocol["source"], film_import.verified_vector(embed_run, entry, rooted, "joint")))
+        joint_rows.append(film_import.candidate_row(
+            entry, protocol["source"], verified_import_vector(embed_run, entry, rooted, "joint")))
     text_rows = []
     reused = 0
     runtime = int(protocol["source"]["runtimeTicks"])
@@ -1547,18 +1646,24 @@ def load_film_rows(film_dir, root_signature):
         start, end = int(entry["start_ticks"]), int(entry["end_ticks"])
         if not 0 <= start < end <= runtime:
             raise BatchBlocked("text candidate is outside the film", reason="coverage-incomplete")
+        if text_overlaps_gap(entry, gaps):
+            raise BatchBlocked("a language gap cannot be imported as text", reason="empty-not-successful")
         state = state_for(embed_run, "text", entry)
         if state.get("status") != "succeeded":
             raise BatchBlocked("text checkpoint is not succeeded", reason="not-succeeded", status=state.get("status"))
         reused += int(bool(state.get("model_input_reused")))
-        vector = film_import.verified_vector(embed_run, entry, rooted, "text")
+        vector = verified_import_vector(embed_run, entry, rooted, "text")
         cloned = dict(entry)
         cloned["candidate_id"] = sample_import.index_text_id(protocol["source"]["itemId"], entry["candidate_id"])
         text_rows.append(film_import.candidate_row(cloned, protocol["source"], vector, entry.get("text")))
     if (embed_run / "protocol.json").read_bytes() != before:
         raise BatchBlocked("embed protocol changed during import", reason="preserved-artifact")
-    return {"protocol": protocol, "source": protocol["source"], "joint_rows": joint_rows,
-            "text_rows": text_rows, "reused_text": reused, "label": protocol["label"]}
+    return {
+        "protocol": protocol, "source": protocol["source"], "joint_rows": joint_rows,
+        "text_rows": text_rows, "reused_text": reused, "label": protocol["label"],
+        "gaps": gaps, "textCoverage": "gapped" if gaps else "full",
+        "successfulEmpty": bool(assessed.get("successfulEmpty")),
+    }
 
 
 def write_index(template, films, references, signature, query_version, output):
@@ -1657,6 +1762,7 @@ def write_index(template, films, references, signature, query_version, output):
             raise BatchBlocked("imported media must be complete", reason="coverage-incomplete")
         if connection.execute("SELECT window_version, processing_id FROM signatures").fetchone() != (contract.VERSION, signature["processing_id"]):
             raise BatchBlocked("index signature does not match the 12-second model", reason="signature-mismatch")
+        text_gaps = [gap for film in films for gap in film.get("gaps") or []]
         evidence = {
             "films": [{
                 "label": film["label"],
@@ -1665,10 +1771,14 @@ def write_index(template, films, references, signature, query_version, output):
                 "runtimeTicks": int(film["source"]["runtimeTicks"]),
                 "windows": len(film["joint_rows"]),
                 "documents": len(film["text_rows"]),
-                "state": "complete",
+                "state": "text-gapped" if film.get("gaps") else "complete",
+                "textCoverage": film.get("textCoverage", "full"),
+                "successfulEmpty": bool(film.get("successfulEmpty")),
+                **({"gaps": film["gaps"]} if film.get("gaps") else {}),
             } for film in films],
-            "fullFilm": True,
-            "coverage": "full",
+            "fullFilm": not text_gaps,
+            "coverage": "gapped" if text_gaps else "full",
+            **({"textGaps": text_gaps} if text_gaps else {}),
             "templateCopied": True,
             "priorIndexOpened": False,
             "liveHostIndexOpened": False,
@@ -1689,7 +1799,7 @@ def write_index(template, films, references, signature, query_version, output):
         connection.close()
 
 
-def import_films(output_root, template, references, import_output, *, allow_partial=False):
+def import_films(output_root, template, references, import_output, *, allow_partial=False, allow_language_gaps=False):
     output_root = Path(output_root)
     manifest = read_json(output_root / "manifest.json")
     try:
@@ -1712,9 +1822,9 @@ def import_films(output_root, template, references, import_output, *, allow_part
         try:
             if not same_source(record["source"], read_json(film_dir / "embed" / "protocol.json")["source"]):
                 raise BatchBlocked("film source does not match the manifest", reason="source-mismatch", label=record["label"])
-            loaded.append(load_film_rows(film_dir, signature))
+            loaded.append(load_film_rows(film_dir, signature, allow_language_gaps=allow_language_gaps))
         except BatchBlocked as exc:
-            if not allow_partial:
+            if allow_language_gaps or not allow_partial:
                 raise
             omitted.append({"label": record["label"], "itemId": record["itemId"], "reason": exc.reason, "status": exc.status})
     if not loaded:
@@ -1725,10 +1835,22 @@ def import_films(output_root, template, references, import_output, *, allow_part
         raise BatchBlocked(str(exc), reason="import-rejected") from exc
     evidence = write_index(template, loaded, vectors, signature, query_version, import_output)
     evidence["omitted"] = omitted
-    evidence["batchCoverage"] = "full" if not omitted else "partial"
-    if omitted:
+    evidence["manifestFilmCount"] = len(manifest["films"])
+    evidence["importedFilmCount"] = len(loaded)
+    text_gaps = [gap for film in loaded for gap in film.get("gaps") or []]
+    if text_gaps:
+        evidence["coverage"] = "gapped"
+        evidence["fullFilm"] = False
+        evidence["batchCoverage"] = "gapped"
+        evidence["languageGapImportPolicy"] = LANGUAGE_GAP_IMPORT_POLICY
+        evidence["textGaps"] = text_gaps
+        evidence["textGappedFilms"] = sum(1 for film in loaded if film.get("gaps"))
+    elif omitted:
+        evidence["batchCoverage"] = "partial"
         evidence["coverage"] = "partial"
         evidence["fullFilm"] = False
+    else:
+        evidence["batchCoverage"] = "full"
     write_json(Path(import_output) / "import-evidence.json", evidence)
     return evidence
 
@@ -1760,6 +1882,7 @@ def command_import(args):
     evidence = import_films(
         config["outputRoot"], config["template"], config["references"], destination,
         allow_partial=args.allow_partial,
+        allow_language_gaps=config.get("languageGapImportPolicy") == LANGUAGE_GAP_IMPORT_POLICY,
     )
     print(json.dumps(public_value(evidence), ensure_ascii=False, indent=2))
     return 0 if evidence["batchCoverage"] == "full" else 2
