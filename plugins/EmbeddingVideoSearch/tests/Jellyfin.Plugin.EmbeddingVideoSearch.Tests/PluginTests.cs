@@ -311,38 +311,113 @@ public class EmbeddingClientTests
     [Fact]
     public async Task Timeouts_are_separate_and_failures_are_not_retried()
     {
+        // The stub withholds the answer until this test releases it. A call that returns while the
+        // answer is still held used its own budget. The guard is only how long we wait to learn that;
+        // the other budgets are longer, so they cannot be the reason the call returned.
+        var guard = TimeSpan.FromSeconds(30);
+        var otherBudget = TimeSpan.FromMinutes(2);
         await using var server = StubServer.Start();
-        server.ResponseDelay = TimeSpan.FromMilliseconds(800);
         var client = new HttpEmbeddingClient(
             metadataTimeout: TimeSpan.FromMilliseconds(300),
-            textTimeout: TimeSpan.FromSeconds(2),
-            videoTimeout: TimeSpan.FromSeconds(2));
+            textTimeout: otherBudget,
+            videoTimeout: otherBudget);
 
-        var metadata = await client.ObserveAsync(server.BaseUrl, CancellationToken.None);
+        server.HoldResponses = true;
+        var metadataTask = client.ObserveAsync(server.BaseUrl, CancellationToken.None);
+        await server.WaitForHits(1).WaitAsync(guard, TestContext.Current.CancellationToken);
+        var metadata = await metadataTask.WaitAsync(guard, TestContext.Current.CancellationToken);
         Assert.Equal("timeout", metadata.ErrorCode);
         Assert.Equal(1, server.HitCount);
+        Assert.Equal(new[] { "/v1/models" }, server.SnapshotPaths());
+        Assert.Equal(0, client.Dispatcher.PostsStarted);
+        await server.ReleaseResponses().WaitAsync(guard, TestContext.Current.CancellationToken);
 
-        var video = await client.EmbedVideoAsync(server.BaseUrl, new MemoryStream([1, 2, 3]), CancellationToken.None);
+        var video = await client.EmbedVideoAsync(server.BaseUrl, new MemoryStream([1, 2, 3]), CancellationToken.None).WaitAsync(guard, TestContext.Current.CancellationToken);
         Assert.True(video.Success);
         Assert.Equal(2, server.HitCount);
+        Assert.Equal(1, client.Dispatcher.PostsStarted);
+        Assert.Equal(new[] { "/v1/models", "/v1/embeddings" }, server.SnapshotPaths());
 
-        server.ResponseDelay = TimeSpan.Zero;
         server.ForcedStatus = 429;
-        var busy = await client.EmbedVideoAsync(server.BaseUrl, new MemoryStream([1]), CancellationToken.None);
+        var busy = await client.EmbedVideoAsync(server.BaseUrl, new MemoryStream([1]), CancellationToken.None).WaitAsync(guard, TestContext.Current.CancellationToken);
         Assert.False(busy.Success);
         Assert.Equal("queueFull", busy.ErrorCode);
         Assert.True(busy.Retryable);
+        Assert.False(busy.CompletionUnknown);
         Assert.Equal(3, server.HitCount);
+        Assert.Equal(2, client.Dispatcher.PostsStarted);
 
         server.ForcedStatus = 200;
-        server.ResponseDelay = TimeSpan.FromSeconds(1);
+        using (var alreadyCancelled = new CancellationTokenSource())
+        {
+            alreadyCancelled.Cancel();
+            var ignored = await client.EmbedTextAsync(server.BaseUrl, "not-sent", alreadyCancelled.Token).WaitAsync(guard, TestContext.Current.CancellationToken);
+            Assert.Equal("cancelled", ignored.ErrorCode);
+            Assert.False(ignored.Retryable);
+            Assert.Equal(3, server.HitCount);
+            Assert.Equal(2, client.Dispatcher.PostsStarted);
+        }
+
+        server.HoldResponses = true;
         using var cancel = new CancellationTokenSource();
         var pending = client.EmbedTextAsync(server.BaseUrl, "synthetic", cancel.Token);
+        await server.WaitForHits(4).WaitAsync(guard, TestContext.Current.CancellationToken);
+        Assert.Equal(3, client.Dispatcher.PostsStarted);
         cancel.Cancel();
-        var cancelled = await pending;
+        var cancelled = await pending.WaitAsync(guard, TestContext.Current.CancellationToken);
         Assert.Equal("cancelled", cancelled.ErrorCode);
         Assert.False(cancelled.Retryable);
-        Assert.InRange(server.HitCount, 3, 4);
+        Assert.False(cancelled.CompletionUnknown);
+        Assert.Equal(4, server.HitCount);
+        Assert.Equal(3, client.Dispatcher.PostsStarted);
+        await server.ReleaseResponses().WaitAsync(guard, TestContext.Current.CancellationToken);
+        Assert.Equal(4, server.HitCount);
+        Assert.Equal(3, client.Dispatcher.PostsStarted);
+
+        await using (var videoServer = StubServer.Start())
+        {
+            videoServer.HoldResponses = true;
+            var videoClient = new HttpEmbeddingClient(
+                metadataTimeout: otherBudget,
+                textTimeout: otherBudget,
+                videoTimeout: TimeSpan.FromMilliseconds(300));
+            var slowVideo = videoClient.EmbedVideoAsync(videoServer.BaseUrl, new MemoryStream([9]), CancellationToken.None);
+            await videoServer.WaitForHits(1).WaitAsync(guard, TestContext.Current.CancellationToken);
+            var videoTimeout = await slowVideo.WaitAsync(guard, TestContext.Current.CancellationToken);
+            Assert.Equal("timeout", videoTimeout.ErrorCode);
+            Assert.False(videoTimeout.Retryable);
+            Assert.True(videoTimeout.CompletionUnknown);
+            Assert.Equal(1, videoClient.Dispatcher.PostsStarted);
+            Assert.Equal(new[] { "/v1/embeddings" }, videoServer.SnapshotPaths());
+            await videoServer.ReleaseResponses().WaitAsync(guard, TestContext.Current.CancellationToken);
+            Assert.Equal(1, videoClient.Dispatcher.PostsStarted);
+            videoClient.Dispatcher.Dispose();
+        }
+
+        await using (var textServer = StubServer.Start())
+        {
+            textServer.HoldResponses = true;
+            var textClient = new HttpEmbeddingClient(
+                metadataTimeout: otherBudget,
+                textTimeout: TimeSpan.FromMilliseconds(300),
+                videoTimeout: otherBudget);
+            var slowText = textClient.EmbedTextAsync(textServer.BaseUrl, "synthetic", CancellationToken.None);
+            await textServer.WaitForHits(1).WaitAsync(guard, TestContext.Current.CancellationToken);
+            var textTimeout = await slowText.WaitAsync(guard, TestContext.Current.CancellationToken);
+            Assert.Equal("timeout", textTimeout.ErrorCode);
+            Assert.False(textTimeout.Retryable);
+            Assert.False(textTimeout.CompletionUnknown);
+            Assert.Equal(1, textClient.Dispatcher.PostsStarted);
+            Assert.Equal(new[] { "/v1/embeddings" }, textServer.SnapshotPaths());
+            await textServer.ReleaseResponses().WaitAsync(guard, TestContext.Current.CancellationToken);
+            var followed = await textClient.EmbedVideoAsync(textServer.BaseUrl, new MemoryStream([4]), CancellationToken.None).WaitAsync(guard, TestContext.Current.CancellationToken);
+            Assert.True(followed.Success);
+            Assert.Equal(2, textClient.Dispatcher.PostsStarted);
+            Assert.Equal(2, textServer.SnapshotPaths().Count(path => path == "/v1/embeddings"));
+            textClient.Dispatcher.Dispose();
+        }
+
+        client.Dispatcher.Dispose();
     }
 }
 
@@ -575,6 +650,11 @@ internal sealed class StubServer : IAsyncDisposable
     private readonly HttpListener _listener;
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _loop;
+    private readonly List<string> _paths = [];
+    private readonly List<(int Count, TaskCompletionSource<bool> Done)> _hitWaiters = [];
+    private bool _holdResponses;
+    private TaskCompletionSource<bool>? _heldRelease;
+    private TaskCompletionSource<bool>? _released;
     public string BaseUrl { get; }
     public List<string> Requests { get; } = [];
     public List<string> Bodies { get; } = [];
@@ -584,6 +664,25 @@ internal sealed class StubServer : IAsyncDisposable
     public bool ReportProcessing { get; set; }
     public double ReportedDuration { get; set; } = 6;
     public int Dimension { get; set; } = ApiV1.Dimension;
+
+    public bool HoldResponses
+    {
+        get
+        {
+            lock (Requests)
+            {
+                return _holdResponses;
+            }
+        }
+
+        set
+        {
+            lock (Requests)
+            {
+                _holdResponses = value;
+            }
+        }
+    }
 
     public static StubServer Start()
     {
@@ -599,6 +698,52 @@ internal sealed class StubServer : IAsyncDisposable
         _listener = listener;
         BaseUrl = baseUrl;
         _loop = Task.Run(Loop);
+    }
+
+    public Task WaitForHits(int count)
+    {
+        lock (Requests)
+        {
+            if (HitCount >= count)
+            {
+                return Task.CompletedTask;
+            }
+
+            var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _hitWaiters.Add((count, done));
+            return done.Task;
+        }
+    }
+
+    public string[] SnapshotPaths()
+    {
+        lock (Requests)
+        {
+            return _paths.ToArray();
+        }
+    }
+
+    public Task ReleaseResponses()
+    {
+        TaskCompletionSource<bool>? parked;
+        Task<bool> finished;
+        lock (Requests)
+        {
+            parked = _heldRelease;
+            _heldRelease = null;
+            _holdResponses = false;
+            if (parked is null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _released = signal;
+            finished = signal.Task;
+        }
+
+        parked.TrySetResult(true);
+        return finished;
     }
 
     public async ValueTask DisposeAsync()
@@ -632,14 +777,37 @@ internal sealed class StubServer : IAsyncDisposable
             {
                 using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding);
                 var body = await reader.ReadToEndAsync().ConfigureAwait(false);
+                var path = context.Request.Url?.AbsolutePath ?? "";
+                TaskCompletionSource<bool>? parked = null;
                 lock (Requests)
                 {
                     Requests.Add(context.Request.Headers.ToString() ?? "");
                     Bodies.Add(body);
+                    _paths.Add(path);
                     HitCount++;
+                    if (_holdResponses)
+                    {
+                        _heldRelease ??= new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        parked = _heldRelease;
+                    }
+
+                    for (var index = _hitWaiters.Count - 1; index >= 0; index--)
+                    {
+                        if (HitCount < _hitWaiters[index].Count)
+                        {
+                            continue;
+                        }
+
+                        _hitWaiters[index].Done.TrySetResult(true);
+                        _hitWaiters.RemoveAt(index);
+                    }
                 }
 
-                if (ResponseDelay > TimeSpan.Zero)
+                if (parked is not null)
+                {
+                    await parked.Task.WaitAsync(_stop.Token).ConfigureAwait(false);
+                }
+                else if (ResponseDelay > TimeSpan.Zero)
                 {
                     await Task.Delay(ResponseDelay).ConfigureAwait(false);
                 }
@@ -714,7 +882,23 @@ internal sealed class StubServer : IAsyncDisposable
                 {
                 }
             }
+            finally
+            {
+                SignalReleased();
+            }
         }
+    }
+
+    private void SignalReleased()
+    {
+        TaskCompletionSource<bool>? finished;
+        lock (Requests)
+        {
+            finished = _released;
+            _released = null;
+        }
+
+        finished?.TrySetResult(true);
     }
 
     private static int FreePort()

@@ -191,6 +191,9 @@ public sealed class SearchRequest
     [JsonPropertyName("limit")]
     public int? Limit { get; set; }
 
+    [JsonPropertyName("collapseRuns")]
+    public bool CollapseRuns { get; set; }
+
     [JsonPropertyName("clientQueryId")]
     public string? ClientQueryId { get; set; }
 }
@@ -249,6 +252,30 @@ public sealed class SearchHit
     [JsonPropertyName("bindingVersion")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? BindingVersion { get; set; }
+
+    /// <summary>Same-film content identity used only to collapse runs. Omitted from JSON.</summary>
+    [JsonIgnore]
+    public string? ContentVersion { get; set; }
+
+    [JsonPropertyName("run")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public HitRun? Run { get; set; }
+
+    [JsonPropertyName("similarAvailable")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? SimilarAvailable { get; set; }
+}
+
+public sealed class HitRun
+{
+    [JsonPropertyName("startTicks")]
+    public long StartTicks { get; set; }
+
+    [JsonPropertyName("endTicks")]
+    public long EndTicks { get; set; }
+
+    [JsonPropertyName("memberCount")]
+    public int MemberCount { get; set; }
 }
 
 public static class SegmentBinding

@@ -182,6 +182,7 @@ public static class CandidateRanking
                     CandidateId = row.CandidateId, AnchorId = row.AnchorId, Canonical = row.Canonical,
                     RepresentationVersion = representation.Version, ReferenceVersion = representation.ReferenceVersion,
                     Transcript = string.IsNullOrWhiteSpace(row.Transcript) ? null : row.Transcript,
+                    ContentVersion = row.ContentVersion,
                     BindingVersion = SegmentBinding.Version(row.SegmentId, row.ItemId, row.MediaSourceId, row.ContentVersion, row.StartTicks, row.EndTicks, representation.Channel == "joint" ? "jointAudioVideo" : "transcriptText", row.CandidateId, representation.Version)
                 });
             }

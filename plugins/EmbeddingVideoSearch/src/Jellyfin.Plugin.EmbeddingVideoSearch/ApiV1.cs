@@ -28,6 +28,7 @@ public static class ApiV1
     public const int MaxGroupedVideos = 3;
     public const int GroupedHitsPerVideo = 5;
     public const string GroupedVideoFeature = "grouped-video-v1";
+    public const string CollapsedRunsFeature = "collapsed-runs-v1";
     public const string UserIdClaim = "Jellyfin-UserId";
 
     public static readonly Guid PluginId = Guid.Parse("8f4c2a91-6d3e-4b7a-9c15-2e8d0f6a4b17");
