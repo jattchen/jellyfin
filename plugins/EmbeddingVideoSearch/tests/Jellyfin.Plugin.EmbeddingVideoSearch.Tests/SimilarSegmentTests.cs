@@ -580,17 +580,14 @@ public class SimilarSegmentTests
         var states = store.MediaStateReads;
         var snapshots = store.CandidateSnapshotReads;
         var access = catalog.Fixture.AccessChecks;
-        var request = new SearchRequest { GroupByVideo = true, Limit = 3, CollapseRuns = true, Diagnostics = true };
-        var response = await catalog.Search("scale-search", request, TestContext.Current.CancellationToken);
+        var plain = new SearchRequest { GroupByVideo = true, Limit = 3, CollapseRuns = true };
+        var response = await catalog.Search("scale-search", plain, TestContext.Current.CancellationToken);
 
         Assert.Equal("referenceTailR", response.QualityPolicy.ScoreMeaning);
         Assert.Equal(1, catalog.Calls);
         Assert.Equal(15, response.Results.Count);
         Assert.Equal(15, response.Results.Sum(hit => hit.Run!.MemberCount));
-        var raw = response.RawResults;
-        Assert.NotNull(raw);
-        Assert.Equal(jointCount + textCount, raw.Count);
-        Assert.All(raw, hit => Assert.Null(hit.Run));
+        Assert.Null(response.RawResults);
         Assert.All(response.Results, hit =>
         {
             Assert.NotNull(hit.Run);
@@ -605,6 +602,20 @@ public class SimilarSegmentTests
         Assert.Equal(3, store.CandidateSnapshotReads - snapshots);
         Assert.Equal(sourceCount * 2, catalog.Fixture.AccessChecks - access);
 
+        states = store.MediaStateReads;
+        var diagnosed = await catalog.Search("scale-diag", new SearchRequest
+        {
+            GroupByVideo = true, Limit = 3, CollapseRuns = true, Diagnostics = true
+        }, TestContext.Current.CancellationToken);
+        var raw = diagnosed.RawResults;
+        Assert.NotNull(raw);
+        Assert.Equal(jointCount + textCount, raw.Count);
+        Assert.All(raw, hit => Assert.Null(hit.Run));
+        Assert.All(raw, hit => Assert.True(hit.IndexComplete));
+        Assert.All(diagnosed.Results, hit => Assert.True(hit.IndexComplete));
+        Assert.Equal(sourceCount, store.MediaStateReads - states);
+        Assert.True(store.MediaStateReads - states < raw.Count);
+
         var firstItems = response.Results.Select(hit => hit.ItemId).ToHashSet();
         var victim = response.Results.Select(hit => hit.ItemId).First(item => item != response.Results[0].ItemId);
         catalog.Fixture.Allow.Remove(victim);
@@ -613,7 +624,7 @@ public class SimilarSegmentTests
         states = store.MediaStateReads;
         snapshots = store.CandidateSnapshotReads;
         access = catalog.Fixture.AccessChecks;
-        var again = await catalog.Search("scale-search-again", request, TestContext.Current.CancellationToken);
+        var again = await catalog.Search("scale-search-again", plain, TestContext.Current.CancellationToken);
         Assert.Equal(15, again.Results.Count);
         Assert.Equal(15, again.Results.Sum(hit => hit.Run!.MemberCount));
         Assert.DoesNotContain(again.Results, hit => hit.ItemId == victim);
@@ -626,7 +637,7 @@ public class SimilarSegmentTests
         Assert.Equal(3, store.CandidateSnapshotReads - snapshots);
         Assert.Equal(sourceCount * 2, catalog.Fixture.AccessChecks - access);
         Assert.Equal("referenceTailR", again.QualityPolicy.ScoreMeaning);
-        Assert.Equal(2, catalog.Calls);
+        Assert.Equal(3, catalog.Calls);
     }
 
     [Fact]
@@ -769,6 +780,80 @@ public class SimilarSegmentTests
         Assert.Equal(versions + 2, catalog.Fixture.Store.StoredContentVersionReads);
         Assert.Equal(access + 1, catalog.Fixture.AccessChecks);
         Assert.Equal(1, catalog.Calls);
+    }
+
+    [Fact]
+    public async Task Main_diagnostics_keeps_partial_coverage_for_off_page_sources()
+    {
+        using var catalog = Catalog.Create();
+        for (var index = 0; index < 4; index++)
+        {
+            catalog.Add("joint", Guid.NewGuid(), "film", 0, 120, Axis(0));
+        }
+
+        catalog.Save();
+        using (var connection = new SqliteConnection("Data Source=" + catalog.Fixture.Store.DatabasePath))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE media SET state = 'partial'";
+            command.ExecuteNonQuery();
+        }
+
+        var response = await catalog.Fixture.Runtime.SearchAsync(catalog.Fixture.UserId, new SearchRequest
+        {
+            Query = "coverage-regression",
+            GroupByVideo = true,
+            Limit = 1,
+            Diagnostics = true
+        }, TestContext.Current.CancellationToken);
+        Assert.Single(response.Results);
+        Assert.False(response.Results[0].IndexComplete);
+        var raw = response.RawResults;
+        Assert.NotNull(raw);
+        Assert.Equal(4, raw.Count);
+        Assert.All(raw, hit => Assert.False(hit.IndexComplete));
+    }
+
+    [Fact]
+    public async Task Diagnostics_reports_real_coverage_on_and_off_the_page()
+    {
+        using var catalog = Catalog.Create();
+        var shown = catalog.Add("joint", Guid.NewGuid(), "film", 0, 120, Tilt(0.99));
+        var partial = catalog.Add("joint", Guid.NewGuid(), "film", 2000, 2120, Tilt(0.5));
+        catalog.Add("joint", partial.ItemId, "film", 4000, 4120, Tilt(0.4));
+        var complete = catalog.Add("joint", Guid.NewGuid(), "film", 8000, 8120, Tilt(0.2));
+        catalog.Save();
+        using (var connection = new SqliteConnection("Data Source=" + catalog.Fixture.Store.DatabasePath))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE media SET state = 'partial' WHERE item_id = $item";
+            command.Parameters.AddWithValue("$item", partial.ItemId.ToString("D"));
+            command.ExecuteNonQuery();
+        }
+
+        var states = catalog.Fixture.Store.MediaStateReads;
+        var response = await catalog.Fixture.Runtime.SearchAsync(catalog.Fixture.UserId, new SearchRequest
+        {
+            Query = "mixed-coverage",
+            GroupByVideo = true,
+            Limit = 1,
+            Diagnostics = true
+        }, TestContext.Current.CancellationToken);
+        var raw = response.RawResults;
+        Assert.NotNull(raw);
+        Assert.Equal(4, raw.Count);
+        Assert.Equal(3, catalog.Fixture.Store.MediaStateReads - states);
+        Assert.True(catalog.Fixture.Store.MediaStateReads - states < raw.Count);
+        var page = Assert.Single(response.Results);
+        Assert.Equal(shown.ItemId, page.ItemId);
+        Assert.True(page.IndexComplete);
+        Assert.Contains(raw, hit => hit.ItemId == shown.ItemId && hit.IndexComplete);
+        Assert.Equal(2, raw.Count(hit => hit.ItemId == partial.ItemId && !hit.IndexComplete));
+        Assert.Contains(raw, hit => hit.ItemId == complete.ItemId && hit.IndexComplete);
+        Assert.Contains(raw, hit => hit.ItemId != shown.ItemId && hit.IndexComplete);
+        Assert.Contains(raw, hit => hit.ItemId != shown.ItemId && !hit.IndexComplete);
     }
 
     private static CandidateRow Row(Guid item, string source, Guid segment, long start, long end) => new()

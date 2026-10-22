@@ -44,7 +44,9 @@ public sealed partial class SearchRuntime
         var selected = request.GroupByVideo
             ? CandidateRanking.TakeByVideo(ranked, limit, ApiV1.GroupedHitsPerVideo)
             : ranked.Take(limit).ToList();
-        ApplyPageCoverage(selected, cancellationToken);
+        // The returned page reads each of its sources once. Diagnostics also publishes the tail,
+        // so that tail must show the stored state instead of the ranker's default.
+        ApplyPageCoverage(request.Diagnostics ? ranked : selected, cancellationToken);
         response.QualityPolicy = CandidateQuality(candidates);
         // Collapse only this already returned page. The lower-ranked tail must not extend a run.
         response.Results = request.CollapseRuns ? RunCollapse.Apply(selected, fresh) : selected;
