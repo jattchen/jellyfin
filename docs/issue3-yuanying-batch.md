@@ -211,6 +211,8 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$REC
 
 导入产物是新目录里的 `prepared-index.db`。它保持 `manual_pause=1`、`imported_candidates_only=1` 和 `http://127.0.0.1:18784`。完成的片在索引里是 `complete`。不要打开正在运行的 `index.db`，也不要把 10 秒签名写进去。
 
+2026-10-22 的主验收核对了这一轮导入。46 部的音画覆盖都是 full，一共 8179 个音画窗口、3293 条有效文字。45 部文字完整。F006 有一处已经批准的语言缺口，块号是 `c0273`，检测到的语言是荷兰语。真实导入的退出码是 2。独立验收的退出码是 0。这次验收不检查转写是不是逐字准确。索引运行时显示 complete，表示这些片子的音画窗口可以搜索。它不能单独用来判断文字没有缺口，文字缺口要看 `import-evidence.json`。原来要一起交付的三项功能还没有整件做完，正式服务也没有换到这份索引。
+
 ## 验收
 
 用上面的绝对解释器，在本工作副本中逐条运行：
