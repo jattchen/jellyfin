@@ -28,6 +28,12 @@ It does not invent an align failure, and it does not run a model.
 videoTailRecovery is another explicit mode. It checks the same succeeded
 responses, and leaves out one never-dispatched last-window partial so the new
 tree can cut that window again under video-tail-hold-last-frame-200ms-v1.
+
+audioGapRecovery is a third explicit mode. It leaves out one named
+terminal-invalid window — its response, state, clip, and clip audit — so the
+new tree can cut that window again under audio-gap-silence-at-source-pts-200ms-v1.
+It does not require a video-tail hold, and a normal batch run still refuses
+to resend that failure while the old state remains.
 """
 
 from __future__ import annotations
@@ -77,6 +83,19 @@ VIDEO_TAIL_FIELDS = (
     "candidate",
     "partialSha256",
     "snapshotSha256",
+)
+AUDIO_GAP_MODE = "audio-gap-recovery-v1"
+AUDIO_GAP_FIELDS = (
+    "version",
+    "film",
+    "candidate",
+    "inputHash",
+    "stateSha256",
+    "responseSha256",
+    "clipSha256",
+    "clipMetaSha256",
+    "snapshotSha256",
+    "errorCode",
 )
 
 
@@ -383,6 +402,13 @@ def rebind_embed(body, output, label):
 def stamp_video_tail(body, output, label):
     rewritten = rebind_embed(body, output, label)
     rewritten["video_tail_policy"] = batch.contract.VIDEO_TAIL_POLICY
+    return rewritten
+
+
+def stamp_audio_gap(body, output, label):
+    """Rebind paths and record the gap policy. Keep a video-tail stamp already present."""
+    rewritten = rebind_embed(body, output, label)
+    rewritten["audio_gap_policy"] = batch.contract.AUDIO_GAP_POLICY
     return rewritten
 
 
@@ -831,6 +857,29 @@ def configured_video_tail(config):
     return {key: value[key] for key in VIDEO_TAIL_FIELDS}
 
 
+def configured_audio_gap(config):
+    """Return the explicit failed-window whitelist, or None."""
+    value = config.get("audioGapRecovery", None)
+    if value in (None, ""):
+        return None
+    if not isinstance(value, dict) or set(value) != set(AUDIO_GAP_FIELDS):
+        raise batch.BatchBlocked("audio gap recovery authorization is incomplete", reason="config")
+    if value.get("version") != AUDIO_GAP_MODE:
+        raise batch.BatchBlocked("unknown audio gap recovery mode", reason="config")
+    film = value.get("film")
+    if not isinstance(film, str) or len(film) != 4 or not film.startswith("F") or not film[1:].isdigit():
+        raise batch.BatchBlocked("audio gap film must look like F041", reason="config")
+    candidate = value.get("candidate")
+    if not isinstance(candidate, str) or candidate in ("", ".", "..") or "/" in candidate or "\\" in candidate:
+        raise batch.BatchBlocked("audio gap candidate is not a file name", reason="config")
+    for key in ("inputHash", "stateSha256", "responseSha256", "clipSha256", "clipMetaSha256", "snapshotSha256"):
+        if not hex64(value.get(key)):
+            raise batch.BatchBlocked("audio gap hash is not 64 hex characters", reason="config")
+    if value.get("errorCode") != "invalid_media":
+        raise batch.BatchBlocked("audio gap recovery only authorizes invalid_media", reason="config")
+    return {key: value[key] for key in AUDIO_GAP_FIELDS}
+
+
 def load_stored_json(path, label=None):
     try:
         return read_json(path)
@@ -848,9 +897,23 @@ def require_embedding(response, signature, kind, window, label):
         ) from exc
 
 
-def embedding_digest(protocol, kind, entry, clip_sha, label):
+def stored_audio_gap(checked, meta_rel, label):
+    if meta_rel not in checked:
+        return None
+    meta = load_stored_json(checked[meta_rel]["path"], label)
+    if not isinstance(meta, dict):
+        return None
     try:
-        digest, window = batch.embed.embedding_input(protocol, kind, entry, clip_sha)
+        return batch.contract.audio_gap_record(meta.get("identity"))
+    except batch.contract.ContractError as exc:
+        raise batch.BatchBlocked(
+            "joint clip hash does not match", reason="cache-hash-mismatch", label=label,
+        ) from exc
+
+
+def embedding_digest(protocol, kind, entry, clip_sha, label, audio_gap=None):
+    try:
+        digest, window = batch.embed.embedding_input(protocol, kind, entry, clip_sha, audio_gap)
     except AssertionError as exc:
         raise batch.BatchBlocked(
             "stored embedding input cannot be checked",
@@ -1076,7 +1139,8 @@ def audit_embeddings(source, checked, authorization, signature):
             clip_sha = same_clip_sha(checked, clip_rel, meta_rel, (state.get("clip") or {}).get("sha256"), label)
             if state.get("response_sha256") != checked[response_rel]["sha256"]:
                 raise batch.BatchBlocked("joint response hash does not match", reason="cache-hash-mismatch", label=label)
-            digest, checked_window = embedding_digest(protocol, "joint", entry, clip_sha, label)
+            digest, checked_window = embedding_digest(
+                protocol, "joint", entry, clip_sha, label, stored_audio_gap(checked, meta_rel, label))
             if state.get("input_hash") != digest:
                 raise batch.BatchBlocked("joint input hash does not match", reason="cache-hash-mismatch", label=label)
             require_embedding(
@@ -1129,7 +1193,10 @@ def audit_embeddings(source, checked, authorization, signature):
         checked, clip_rel, meta_rel,
         (unknown["state"].get("clip") or {}).get("sha256"), unknown["label"],
     )
-    digest, _window = embedding_digest(unknown["protocol"], "joint", unknown["entry"], clip_sha, unknown["label"])
+    digest, _window = embedding_digest(
+        unknown["protocol"], "joint", unknown["entry"], clip_sha, unknown["label"],
+        stored_audio_gap(checked, meta_rel, unknown["label"]),
+    )
     if digest != authorization["inputHash"]:
         raise batch.BatchBlocked("inflight input hash does not match the clip", reason="cache-hash-mismatch", label=unknown["label"])
     reused_shared = audit_shared_documents(checked, expected, window)
@@ -1322,7 +1389,8 @@ def audit_video_tail(source, checked, authorization, signature):
             clip_sha = same_clip_sha(checked, clip_rel, meta_rel, (state.get("clip") or {}).get("sha256"), label)
             if state.get("response_sha256") != checked[response_rel]["sha256"]:
                 raise batch.BatchBlocked("joint response hash does not match", reason="cache-hash-mismatch", label=label)
-            digest, checked_window = embedding_digest(protocol, "joint", entry, clip_sha, label)
+            digest, checked_window = embedding_digest(
+                protocol, "joint", entry, clip_sha, label, stored_audio_gap(checked, meta_rel, label))
             if state.get("input_hash") != digest:
                 raise batch.BatchBlocked("joint input hash does not match", reason="cache-hash-mismatch", label=label)
             require_embedding(
@@ -1462,6 +1530,264 @@ def plan_video_tail(source, checked, output, authorization, snapshot):
     }
 
 
+def audit_audio_gap(source, checked, authorization, signature):
+    """Check every film first. Omit only one named terminal-invalid window."""
+    groups, _shared, _roots = film_groups(checked)
+    expected = batch.contract.signature_template(signature)
+    window = None
+    failures = []
+    referenced = set()
+    reused_joints = 0
+    reused_text = 0
+    not_started = 0
+    cached_without_dispatch = 0
+    for label, _rels in sorted(groups.items()):
+        protocol_rel = f"films/{label}/embed/protocol.json"
+        if protocol_rel not in checked:
+            raise batch.BatchBlocked("embed protocol is missing", reason="source-mismatch", label=label)
+        protocol = load_stored_json(checked[protocol_rel]["path"], label)
+        if not isinstance(protocol, dict):
+            raise batch.BatchBlocked("embed protocol is not an object", reason="source-mismatch", label=label)
+        film_window = require_window(protocol, label)
+        require_signature(protocol, expected, label)
+        window = film_window
+        windows = protocol.get("joint_windows") or []
+        if not isinstance(windows, list):
+            raise batch.BatchBlocked("joint windows are not a list", reason="source-mismatch", label=label)
+        seen = set()
+        for entry in windows:
+            if not isinstance(entry, dict):
+                raise batch.BatchBlocked("joint window is incomplete", reason="source-mismatch", label=label)
+            candidate = entry.get("candidate_id")
+            if not isinstance(candidate, str) or candidate in ("", ".", "..") or "/" in candidate or "\\" in candidate:
+                raise batch.BatchBlocked("joint candidate is not a file name", reason="source-mismatch", label=label)
+            if candidate in seen:
+                raise batch.BatchBlocked("joint candidate ids are duplicated", reason="source-mismatch", label=label)
+            seen.add(candidate)
+            state_rel = f"films/{label}/embed/joint/{candidate}.state.json"
+            response_rel = f"films/{label}/embed/joint/{candidate}.json"
+            clip_rel, meta_rel, partial_rel = clip_rels(label, candidate)
+            referenced.update(rel for rel in (state_rel, response_rel, clip_rel, meta_rel, partial_rel) if rel in checked)
+            has_state = state_rel in checked
+            has_response = response_rel in checked
+            has_clip = clip_rel in checked
+            has_meta = meta_rel in checked
+            has_partial = partial_rel in checked
+            if not has_state:
+                if has_response or has_partial or has_clip or has_meta:
+                    if has_clip and has_meta and not has_response and not has_partial:
+                        same_clip_sha(
+                            checked, clip_rel, meta_rel,
+                            load_stored_json(checked[meta_rel]["path"], label).get("sha256"), label,
+                        )
+                        cached_without_dispatch += 1
+                        continue
+                    raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=label)
+                not_started += 1
+                continue
+            state = load_stored_json(checked[state_rel]["path"], label)
+            if not isinstance(state, dict) or state.get("candidate_id") != candidate:
+                raise batch.BatchBlocked("joint state does not match its candidate", reason="source-mismatch", label=label)
+            if state.get("status") != "succeeded":
+                failures.append({
+                    "label": label,
+                    "candidate": candidate,
+                    "status": state.get("status"),
+                    "httpStatus": state.get("http_status"),
+                    "inputHash": state.get("input_hash"),
+                    "stateRel": state_rel,
+                    "responseRel": response_rel,
+                    "clipRel": clip_rel,
+                    "metaRel": meta_rel,
+                    "hasResponse": has_response,
+                    "hasClip": has_clip,
+                    "hasMeta": has_meta,
+                    "hasPartial": has_partial,
+                    "state": state,
+                    "protocol": protocol,
+                    "entry": entry,
+                })
+                continue
+            if has_partial:
+                raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch", label=label)
+            if not has_response:
+                raise batch.BatchBlocked("succeeded joint is missing its response", reason="source-mismatch", label=label)
+            clip_sha = same_clip_sha(checked, clip_rel, meta_rel, (state.get("clip") or {}).get("sha256"), label)
+            if state.get("response_sha256") != checked[response_rel]["sha256"]:
+                raise batch.BatchBlocked("joint response hash does not match", reason="cache-hash-mismatch", label=label)
+            digest, checked_window = embedding_digest(
+                protocol, "joint", entry, clip_sha, label, stored_audio_gap(checked, meta_rel, label))
+            if state.get("input_hash") != digest:
+                raise batch.BatchBlocked("joint input hash does not match", reason="cache-hash-mismatch", label=label)
+            require_embedding(
+                load_stored_json(checked[response_rel]["path"], label),
+                protocol["signature"], "joint", checked_window, label,
+            )
+            reused_joints += 1
+        reused_text += audit_text(checked, label, protocol, protocol["signature"], film_window)
+        prefix = f"films/{label}/embed/"
+        for rel in checked:
+            if not rel.startswith(prefix):
+                continue
+            name = rel[len(prefix):]
+            if name.startswith("joint/") or name.startswith("clips/"):
+                if rel not in referenced and name != "protocol.json":
+                    if rel.startswith(prefix + "joint/") or rel.startswith(prefix + "clips/"):
+                        raise batch.BatchBlocked("orphan joint file", reason="source-mismatch", label=label)
+    if window is None:
+        raise batch.BatchBlocked("recovery source has no embed protocol", reason="source-mismatch")
+    for rel in checked:
+        if rel.endswith(".partial.mp4"):
+            raise batch.BatchBlocked("incomplete clip needs inspection", reason="source-mismatch")
+    if len(failures) != 1:
+        raise batch.BatchBlocked(
+            "audio gap recovery requires exactly one terminal-invalid window",
+            reason="not-succeeded",
+        )
+    found = failures[0]
+    if found["status"] != "terminal-invalid" or found["httpStatus"] != 422:
+        raise batch.BatchBlocked(
+            "authorized window is not a terminal invalid response",
+            reason="not-succeeded", label=found["label"],
+        )
+    if (
+        not found["hasResponse"] or not found["hasClip"] or not found["hasMeta"] or found["hasPartial"]
+    ):
+        raise batch.BatchBlocked("authorized window is missing its four files", reason="source-mismatch", label=found["label"])
+    if found["label"] != authorization["film"] or found["candidate"] != authorization["candidate"]:
+        raise batch.BatchBlocked(
+            "authorized window does not match the failed candidate",
+            reason="source-mismatch", label=found["label"],
+        )
+    if (
+        found["inputHash"] != authorization["inputHash"]
+        or checked[found["stateRel"]]["sha256"] != authorization["stateSha256"]
+        or checked[found["responseRel"]]["sha256"] != authorization["responseSha256"]
+        or checked[found["clipRel"]]["sha256"] != authorization["clipSha256"]
+        or checked[found["metaRel"]]["sha256"] != authorization["clipMetaSha256"]
+    ):
+        raise batch.BatchBlocked(
+            "authorized window hash does not match",
+            reason="source-mismatch", label=found["label"],
+        )
+    clip_sha = same_clip_sha(
+        checked, found["clipRel"], found["metaRel"],
+        (found["state"].get("clip") or {}).get("sha256"), found["label"],
+    )
+    if clip_sha != authorization["clipSha256"]:
+        raise batch.BatchBlocked(
+            "authorized clip hash does not match",
+            reason="source-mismatch", label=found["label"],
+        )
+    if found["state"].get("response_sha256") != authorization["responseSha256"]:
+        raise batch.BatchBlocked(
+            "authorized response hash does not match",
+            reason="source-mismatch", label=found["label"],
+        )
+    response = load_stored_json(checked[found["responseRel"]]["path"], found["label"])
+    error = response.get("error") if isinstance(response, dict) else None
+    if not isinstance(error, dict) or error.get("code") != authorization["errorCode"]:
+        raise batch.BatchBlocked(
+            "authorized response is not invalid_media",
+            reason="source-mismatch", label=found["label"],
+        )
+    digest, _window = embedding_digest(
+        found["protocol"], "joint", found["entry"], clip_sha, found["label"],
+        stored_audio_gap(checked, found["metaRel"], found["label"]),
+    )
+    if digest != authorization["inputHash"]:
+        raise batch.BatchBlocked(
+            "authorized input hash does not match the clip",
+            reason="cache-hash-mismatch", label=found["label"],
+        )
+    reused_shared = audit_shared_documents(checked, expected, window)
+    evidence = {
+        "film": found["label"],
+        "candidate": found["candidate"],
+        "status": "terminal-invalid",
+        "httpStatus": 422,
+        "errorCode": authorization["errorCode"],
+        "inputHash": authorization["inputHash"],
+        "responsePresent": True,
+        "sourceRelativePath": found["stateRel"],
+    }
+    omitted = [found["responseRel"], found["stateRel"], found["clipRel"], found["metaRel"]]
+    return {
+        "reusedSucceededJoints": reused_joints,
+        "reusedSucceededText": reused_text,
+        "reusedSharedDocuments": reused_shared,
+        "notStartedJoints": not_started,
+        "cachedClipsWithoutDispatch": cached_without_dispatch,
+        "omit": omitted,
+        "omittedWindow": omitted,
+        "unknownEvidence": evidence,
+    }
+
+
+def plan_audio_gap(source, checked, output, authorization, snapshot):
+    """Copy a finished alignment tree. Omit only the one authorized failed window."""
+    groups, _shared, roots = film_groups(checked)
+    if "manifest.json" not in roots:
+        raise batch.BatchBlocked("snapshot has no manifest", reason="source-mismatch")
+    unexpected = [name for name in roots if name not in SKIPPED_ROOT_FILES and name != "manifest.json"]
+    if unexpected:
+        raise batch.BatchBlocked("unexpected recovery source file", reason="source-mismatch")
+    films = [classify_film(label, rels, source, checked) for label, rels in sorted(groups.items())]
+    for film in films:
+        if film["kind"] not in ("settled", "pending"):
+            raise batch.BatchBlocked(
+                "audio gap recovery does not accept an unresolved transcription failure",
+                reason="transcription-failed", label=film["label"],
+            )
+    audit = audit_audio_gap(source, checked, authorization, batch.EXPECTED_PROCESSING_ID)
+    omit = set(audit["omit"])
+    copies = []
+    rewrites = []
+    for rel in sorted(checked):
+        if rel in SKIPPED_ROOT_FILES or rel in omit:
+            continue
+        if rel == "manifest.json":
+            copies.append({"path": rel, "action": "copied", "source": rel})
+            continue
+        film_label_value = Path(rel).parts[1] if rel.startswith("films/") else None
+        if rel.endswith("/asr/chunks.json") and film_label_value is not None:
+            rewritten, changed = rebind_chunks(read_json(source / rel), output, checked, film_label_value)
+            if changed:
+                rewrites.append({
+                    "path": rel, "action": "rebound", "source": rel, "data": json_bytes(rewritten),
+                })
+                continue
+        if rel.endswith("/embed/protocol.json") and film_label_value is not None:
+            rewrites.append({
+                "path": rel,
+                "action": "rebound",
+                "source": rel,
+                "data": json_bytes(stamp_audio_gap(read_json(source / rel), output, film_label_value)),
+            })
+            continue
+        copies.append({"path": rel, "action": "copied", "source": rel})
+    omitted = sorted(name for name in roots if name in SKIPPED_ROOT_FILES)
+    return {
+        "copies": copies,
+        "rewrites": rewrites,
+        "derived": None,
+        "tail": None,
+        "derivedTails": [],
+        "omittedSourceFiles": omitted,
+        "audioGap": {
+            "authorization": {key: authorization[key] for key in AUDIO_GAP_FIELDS},
+            "unknownEvidence": audit["unknownEvidence"],
+            "omittedWindow": audit["omittedWindow"],
+            "reusedSucceededJoints": audit["reusedSucceededJoints"],
+            "reusedSucceededText": audit["reusedSucceededText"],
+            "reusedSharedDocuments": audit["reusedSharedDocuments"],
+            "notStartedJoints": audit["notStartedJoints"],
+            "cachedClipsWithoutDispatch": audit["cachedClipsWithoutDispatch"],
+            "snapshotTotalBytes": int(snapshot["totalBytes"]),
+        },
+    }
+
+
 def receipt_body(config, snapshot_path, snapshot, plan, written):
     derived = plan.get("derived")
     skips = []
@@ -1532,19 +1858,39 @@ def receipt_body(config, snapshot_path, snapshot, plan, written):
         body["videoTailPolicy"] = batch.contract.VIDEO_TAIL_POLICY
         body["transcriptionAccuracyVerified"] = False
         body["batchExitAccepted"] = False
+    audio_gap = plan.get("audioGap")
+    if audio_gap is not None:
+        body["mode"] = AUDIO_GAP_MODE
+        body["authorization"] = audio_gap["authorization"]
+        body["unknownEvidence"] = audio_gap["unknownEvidence"]
+        body["omittedWindow"] = audio_gap["omittedWindow"]
+        body["reusedSucceededJoints"] = audio_gap["reusedSucceededJoints"]
+        body["reusedSucceededText"] = audio_gap["reusedSucceededText"]
+        body["reusedSharedDocuments"] = audio_gap["reusedSharedDocuments"]
+        body["notStartedJoints"] = audio_gap["notStartedJoints"]
+        body["cachedClipsWithoutDispatch"] = audio_gap["cachedClipsWithoutDispatch"]
+        body["snapshotTotalBytes"] = audio_gap["snapshotTotalBytes"]
+        body["copyCount"] = len(plan["copies"])
+        body["rebindCount"] = len(plan["rewrites"])
+        body["modelRequests"] = 0
+        body["rebuiltWindow"] = 1
+        body["audioGapPolicy"] = batch.contract.AUDIO_GAP_POLICY
+        body["transcriptionAccuracyVerified"] = False
+        body["batchExitAccepted"] = False
     return body
 
 
-def confirm_idempotent(output, checked, tail_policy=None, interruption=None, video_tail=None):
+def confirm_idempotent(output, checked, tail_policy=None, interruption=None, video_tail=None, audio_gap=None):
     receipt_path = Path(output) / RECEIPT_NAME
     if not receipt_path.is_file():
         raise batch.BatchBlocked("recovery output exists without a receipt", reason="output-exists")
     receipt = read_json(receipt_path)
     if receipt.get("version") != RECEIPT_VERSION or receipt.get("policy") != POLICY or receipt.get("hardlink") is not False:
         raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
-    if interruption is not None and video_tail is not None:
+    chosen = [item for item in (interruption, video_tail, audio_gap) if item is not None]
+    if len(chosen) > 1:
         raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
-    if interruption is None and video_tail is None:
+    if not chosen:
         if receipt.get("mode"):
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
         if (receipt.get("alignmentTimePolicy") or None) != (tail_policy or None):
@@ -1558,7 +1904,7 @@ def confirm_idempotent(output, checked, tail_policy=None, interruption=None, vid
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
         if receipt.get("snapshotSha256") != interruption["snapshotSha256"]:
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
-    else:
+    elif video_tail is not None:
         evidence = receipt.get("unknownEvidence") or {}
         if receipt.get("mode") != VIDEO_TAIL_MODE or receipt.get("authorization") != video_tail:
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
@@ -1575,6 +1921,20 @@ def confirm_idempotent(output, checked, tail_policy=None, interruption=None, vid
             or evidence.get("responsePresent") is not False
             or evidence.get("dispatchPresent") is not False
         ):
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+    else:
+        evidence = receipt.get("unknownEvidence") or {}
+        if receipt.get("mode") != AUDIO_GAP_MODE or receipt.get("authorization") != audio_gap:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("modelRequests") != 0 or receipt.get("rebuiltWindow") != 1 or "authorizedResends" in receipt:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("audioGapPolicy") != batch.contract.AUDIO_GAP_POLICY:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("batchExitAccepted") is not False or receipt.get("transcriptionAccuracyVerified") is not False:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if receipt.get("snapshotSha256") != audio_gap["snapshotSha256"]:
+            raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
+        if evidence.get("status") != "terminal-invalid" or evidence.get("errorCode") != "invalid_media":
             raise batch.BatchBlocked("recovery receipt does not match this prepare", reason="output-exists")
     expected = {item["path"]: item for item in receipt.get("files") or []}
     present = listed_files(output)
@@ -1604,10 +1964,14 @@ def prepare(config):
     tail_name = configured_tail(config)
     interruption = configured_interruption(config)
     video_tail = configured_video_tail(config)
-    if interruption is not None and video_tail is not None:
+    audio_gap = configured_audio_gap(config)
+    selected = [item for item in (interruption, video_tail, audio_gap) if item is not None]
+    if len(selected) > 1:
         raise batch.BatchBlocked("recovery accepts only one explicit mode", reason="config")
     if video_tail is not None and config.get("videoTailPolicy") != batch.contract.VIDEO_TAIL_POLICY:
         raise batch.BatchBlocked("video tail recovery requires the hold-last-frame policy", reason="config")
+    if audio_gap is not None and config.get("audioGapPolicy") != batch.contract.AUDIO_GAP_POLICY:
+        raise batch.BatchBlocked("audio gap recovery requires the source-gap silence policy", reason="config")
     for key in ("recoverySource", "recoverySnapshot"):
         if not config.get(key):
             raise batch.BatchBlocked("config missing " + key, reason="config")
@@ -1629,16 +1993,23 @@ def prepare(config):
             "snapshot hash does not match the video tail authorization",
             reason="source-mismatch",
         )
+    if audio_gap is not None and file_sha256(snapshot_path) != audio_gap["snapshotSha256"]:
+        raise batch.BatchBlocked(
+            "snapshot hash does not match the audio gap authorization",
+            reason="source-mismatch",
+        )
     if output.exists():
         if not output.is_dir():
             raise batch.BatchBlocked("recovery output exists", reason="output-exists")
-        receipt = confirm_idempotent(output, checked, tail_name, interruption, video_tail)
+        receipt = confirm_idempotent(output, checked, tail_name, interruption, video_tail, audio_gap)
         source_unchanged(checked)
         return receipt
     if interruption is not None:
         plan = plan_interruption(source, checked, output, interruption, snapshot)
     elif video_tail is not None:
         plan = plan_video_tail(source, checked, output, video_tail, snapshot)
+    elif audio_gap is not None:
+        plan = plan_audio_gap(source, checked, output, audio_gap, snapshot)
     else:
         plan = plan_recovery(source, checked, output, tail_policy=tail_name is not None)
     output.mkdir(mode=0o700)
@@ -1659,7 +2030,7 @@ def prepare(config):
 
 def main(argv=None):
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description="把已完成的批次按字节复制到新目录。可派生一处语言缺口，离线复核一处不超过 80 毫秒的末字越界，按显式白名单省略一处存储中断的音画请求，或省略一处从未派发的片尾残片以便定格重切。不推理。")
+    parser = argparse.ArgumentParser(description="把已完成的批次按字节复制到新目录。可派生一处语言缺口，离线复核一处不超过 80 毫秒的末字越界，按显式白名单省略一处存储中断的音画请求，省略一处从未派发的片尾残片以便定格重切，或省略一处音轨空档失败窗口以便按原位置补静音后重切。不推理。")
     parser.add_argument("command", choices=("prepare",))
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -1697,6 +2068,16 @@ def main(argv=None):
         summary["modelRequests"] = receipt["modelRequests"]
         summary["rebuiltPartial"] = receipt["rebuiltPartial"]
         summary["videoTailPolicy"] = receipt["videoTailPolicy"]
+        summary["batchExitAccepted"] = receipt["batchExitAccepted"]
+        summary["transcriptionAccuracyVerified"] = receipt["transcriptionAccuracyVerified"]
+    if receipt.get("mode") == AUDIO_GAP_MODE:
+        summary["mode"] = receipt["mode"]
+        summary["film"] = receipt["authorization"]["film"]
+        summary["candidate"] = receipt["authorization"]["candidate"]
+        summary["reusedSucceededJoints"] = receipt["reusedSucceededJoints"]
+        summary["modelRequests"] = receipt["modelRequests"]
+        summary["rebuiltWindow"] = receipt["rebuiltWindow"]
+        summary["audioGapPolicy"] = receipt["audioGapPolicy"]
         summary["batchExitAccepted"] = receipt["batchExitAccepted"]
         summary["transcriptionAccuracyVerified"] = receipt["transcriptionAccuracyVerified"]
     print(json.dumps(summary, ensure_ascii=False, indent=2))

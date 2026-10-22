@@ -8,12 +8,13 @@ back with provenance.absoluteOffsetTicks. This script does not embed,
 transcribe, or call a model.
 """
 import argparse
-from decimal import Decimal, ROUND_CEILING, ROUND_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, ROUND_UP
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import time
 import uuid
@@ -27,6 +28,20 @@ SAMPLE_TICKS = 1_200_000_000
 SAMPLED_SECONDS = [0, 3, 6, 9]
 VIDEO_TAIL_POLICY = "video-tail-hold-last-frame-200ms-v1"
 VIDEO_TAIL_LIMIT = Decimal("0.200")
+AUDIO_GAP_POLICY = "audio-gap-silence-at-source-pts-200ms-v1"
+# Fill only real internal holes. One millisecond of clock noise stays on the old cut.
+# A window whose holes add up to more than 200 ms stops instead of hiding the loss.
+AUDIO_GAP_LIMIT = Decimal("0.200")
+AUDIO_GAP_NOISE = Decimal("0.001")
+AUDIO_GAP_FILTER = "aresample=async=1:min_hard_comp=0.001:first_pts=0"
+AUDIO_GAP_FIELDS = (
+    "audio_gap_policy",
+    "audio_gap_total_seconds",
+    "audio_gap_count",
+    "audio_gaps",
+)
+AUDIO_RATE = 16000
+AUDIO_GAP_SILENCE = 0.05
 MAX_SOFT_TOKENS = 70
 MODEL_ID = "google/embeddinggemma-2"
 REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
@@ -661,6 +676,11 @@ def _seconds_text(value):
     return format(value, "f")
 
 
+def _gap_seconds_text(value):
+    """Microseconds, always six digits, so the same hole has one hash string."""
+    return format(_microseconds(value), ".6f")
+
+
 def classify_video_tail(probe, audio_stream_index, runtime_ticks, frame_rate=None):
     """Classify a frozen source end. This does not open the media."""
     try:
@@ -761,10 +781,239 @@ def probe_frame_rate(source_path, video_stream_index=0):
     return rate
 
 
-def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe, video_tail_extension=None):
+def _finite_decimal(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(str(value))
+    except Exception:
+        return None
+    if not number.is_finite():
+        return None
+    return number
+
+
+def _microseconds(value):
+    quantum = Decimal("0.000001")
+    return (value / quantum).to_integral_value(rounding=ROUND_HALF_UP) * quantum
+
+
+def classify_audio_gaps(frames, window_start, window_end, sample_rate):
+    """Internal holes inside one window. Frame order is the probe order."""
+    try:
+        rate = Decimal(int(sample_rate))
+    except (TypeError, ValueError) as exc:
+        raise ContractError("audio gap cannot be located") from exc
+    if rate <= 0:
+        raise ContractError("audio gap cannot be located")
+    start = Decimal(window_start)
+    end = Decimal(window_end)
+    if end <= start or not isinstance(frames, list) or not frames:
+        raise ContractError("audio gap cannot be located")
+    parsed = []
+    previous_pts = None
+    for frame in frames:
+        if not isinstance(frame, dict):
+            raise ContractError("audio gap cannot be located")
+        pts = _finite_decimal(frame.get("pts_time"))
+        samples = frame.get("nb_samples")
+        if pts is None or isinstance(samples, bool) or samples is None:
+            raise ContractError("audio gap cannot be located")
+        try:
+            count = int(samples)
+        except (TypeError, ValueError) as exc:
+            raise ContractError("audio gap cannot be located") from exc
+        if count <= 0:
+            raise ContractError("audio gap cannot be located")
+        if previous_pts is not None and pts < previous_pts:
+            raise ContractError("audio timestamps go backwards")
+        previous_pts = pts
+        parsed.append((pts, pts + (Decimal(count) / rate)))
+    gaps = []
+    for (_pts, frame_end), (next_pts, _next_end) in zip(parsed, parsed[1:]):
+        raw = next_pts - frame_end
+        if raw < -AUDIO_GAP_NOISE:
+            raise ContractError("audio timestamps overlap")
+        if raw <= AUDIO_GAP_NOISE:
+            continue
+        overlap_start = max(frame_end, start)
+        overlap_end = min(next_pts, end)
+        if overlap_end <= overlap_start:
+            continue
+        gaps.append((overlap_start, overlap_end))
+    return gaps
+
+
+def finalize_audio_gaps(gaps, window_start):
+    """Stop above 200 ms. Store the in-window holes quantized to microseconds."""
+    if not gaps:
+        return {"status": "continuous", "gaps": [], "total": Decimal(0)}
+    total = sum((end - start for start, end in gaps), Decimal(0))
+    if total > AUDIO_GAP_LIMIT:
+        raise ContractError("audio gap is longer than 200 milliseconds")
+    identity_gaps = []
+    origin = Decimal(window_start)
+    for start, end in gaps:
+        rel_start = _microseconds(start - origin)
+        rel_end = _microseconds(end - origin)
+        if rel_end <= rel_start:
+            continue
+        identity_gaps.append({
+            "start_seconds": _gap_seconds_text(rel_start),
+            "end_seconds": _gap_seconds_text(rel_end),
+            "seconds": _gap_seconds_text(rel_end - rel_start),
+        })
+    if not identity_gaps:
+        return {"status": "continuous", "gaps": [], "total": Decimal(0)}
+    stored = sum((Decimal(item["seconds"]) for item in identity_gaps), Decimal(0))
+    return {
+        "status": "gaps",
+        "gaps": identity_gaps,
+        "total": total,
+        "total_seconds": _gap_seconds_text(stored),
+        "count": len(identity_gaps),
+    }
+
+
+def probe_audio_frames(source_path, audio_stream_index, start_seconds, duration_seconds="12"):
+    """Read one absolute audio stream. Do not sort the frames."""
+    try:
+        index = int(audio_stream_index)
+    except (TypeError, ValueError) as exc:
+        raise ContractError("audio gap cannot be located") from exc
+    if index < 0:
+        raise ContractError("audio gap cannot be located")
+    completed = subprocess.run(
+        ["/usr/local/bin/ffprobe", "-v", "error", "-select_streams", str(index),
+         "-read_intervals", str(start_seconds) + "%+" + str(duration_seconds),
+         "-show_frames",
+         "-show_entries", "frame=pts_time,nb_samples:stream=sample_rate,codec_type,index,start_time",
+         "-of", "json", str(source_path)],
+        check=False, capture_output=True, timeout=120,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        raise ContractError("audio gap cannot be located")
+    try:
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContractError("audio gap cannot be located") from exc
+    streams = document.get("streams") or []
+    if not streams or streams[0].get("codec_type") != "audio":
+        raise ContractError("audio gap cannot be located")
+    try:
+        found = int(streams[0].get("index"))
+    except (TypeError, ValueError) as exc:
+        raise ContractError("audio gap cannot be located") from exc
+    if found != index:
+        raise ContractError("audio gap cannot be located")
+    frames = document.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ContractError("audio gap cannot be located")
+    return frames, streams[0].get("sample_rate"), streams[0].get("start_time")
+
+
+def clip_timeline_frames(frames, start_time):
+    """Packet time includes the stream start. The clip clock, after -ss, does not."""
+    shift = _finite_decimal(start_time)
+    if shift is None or not isinstance(frames, list):
+        raise ContractError("audio gap cannot be located")
+    shifted = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            shifted.append(frame)
+            continue
+        pts = _finite_decimal(frame.get("pts_time"))
+        if pts is None:
+            shifted.append(frame)
+            continue
+        item = dict(frame)
+        item["pts_time"] = format(pts - shift, "f")
+        shifted.append(item)
+    return shifted
+
+
+def measure_audio_gaps(source_path, audio_stream_index, start_ticks):
+    start_text = ticks_to_seconds(int(start_ticks))
+    window_start = Decimal(int(start_ticks)) / Decimal(10_000_000)
+    window_end = window_start + Decimal(12)
+    frames, rate, start_time = probe_audio_frames(source_path, audio_stream_index, start_text, "12")
+    frames = clip_timeline_frames(frames, start_time)
+    gaps = classify_audio_gaps(frames, window_start, window_end, rate)
+    return finalize_audio_gaps(gaps, window_start)
+
+
+def audio_gap_record(identity):
+    """Hash payload for a filled clip. Absent means the old input hash."""
+    if not isinstance(identity, dict) or "audio_gap_policy" not in identity:
+        return None
+    if any(key not in identity for key in AUDIO_GAP_FIELDS):
+        raise ContractError("audio gap identity is incomplete")
+    return {key: identity[key] for key in AUDIO_GAP_FIELDS}
+
+
+def identity_with_audio_gap(identity, decision):
+    if not decision or decision.get("status") != "gaps":
+        return identity
+    extended = dict(identity)
+    extended["audio_gap_policy"] = AUDIO_GAP_POLICY
+    extended["audio_gap_total_seconds"] = decision["total_seconds"]
+    extended["audio_gap_count"] = decision["count"]
+    extended["audio_gaps"] = decision["gaps"]
+    return extended
+
+
+def read_decoded_pcm(path):
+    completed = subprocess.run(
+        ["/usr/local/bin/ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+         "-i", str(path), "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+        check=False, capture_output=True, timeout=180,
+    )
+    if completed.returncode != 0 or not completed.stdout or len(completed.stdout) % 4:
+        raise ContractError("decoded audio cannot be measured")
+    return completed.stdout
+
+
+def require_decoded_coverage(pcm, clip_seconds):
+    heard = Decimal(len(pcm) // 4) / Decimal(AUDIO_RATE)
+    if not clip_duration_accepted(float(heard)) or not audio_covers_clip(float(heard), float(clip_seconds)):
+        raise ContractError("decoded audio does not cover the 12 second clip within 0.15 seconds")
+    return heard
+
+
+def _pcm_mean_abs(pcm, start, end):
+    rate = Decimal(AUDIO_RATE)
+    first = int((Decimal(start) * rate).to_integral_value(rounding=ROUND_HALF_UP))
+    last = int((Decimal(end) * rate).to_integral_value(rounding=ROUND_HALF_UP))
+    if last <= first or last * 4 > len(pcm):
+        raise ContractError("audio gap cannot be located")
+    total = 0.0
+    count = 0
+    for (value,) in struct.iter_unpack("<f", pcm[first * 4:last * 4]):
+        total += abs(value)
+        count += 1
+    if count == 0:
+        raise ContractError("audio gap cannot be located")
+    return total / count
+
+
+def require_gap_silence(pcm, gaps):
+    """Silence belongs in the measured hole, not only at the end of the clip."""
+    for gap in gaps:
+        start = Decimal(gap["start_seconds"])
+        end = Decimal(gap["end_seconds"])
+        width = end - start
+        margin = min(Decimal("0.010"), width * Decimal("0.25"))
+        if _pcm_mean_abs(pcm, start + margin, end - margin) > AUDIO_GAP_SILENCE:
+            raise ContractError("audio gap was not filled at its original position")
+
+
+def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe, video_tail_extension=None, fill_audio_gap=False):
     facts = check_source_probe(probe, audio_stream_index)
     video_map = facts["video_map"]
     start = ticks_to_seconds(int(start_ticks))
+    fill = fill_audio_gap is True
+    if fill_audio_gap not in (True, False, None):
+        raise ContractError("audio gap filter is not explicit")
     arguments = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-accurate_seek",
         "-ss", start, "-i", str(source),
@@ -772,16 +1021,28 @@ def clip_ffmpeg_arguments(source, start_ticks, audio_stream_index, output, probe
     if video_tail_extension:
         if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", str(video_tail_extension)):
             raise ContractError("video tail extension is not a duration")
+    if video_tail_extension and fill:
+        graph = (
+            "[" + video_map + "]tpad=stop_mode=clone:stop_duration=" + str(video_tail_extension)
+            + "[v];[" + facts["audio_map"] + "]" + AUDIO_GAP_FILTER + "[a]"
+        )
+        arguments.extend(["-filter_complex", graph, "-map", "[v]", "-map", "[a]"])
+    elif video_tail_extension:
         arguments.extend([
             "-filter_complex",
             "[" + video_map + "]tpad=stop_mode=clone:stop_duration=" + str(video_tail_extension) + "[v]",
             "-map", "[v]",
         ])
     arguments.extend(["-t", "12"])
-    if not video_tail_extension:
-        arguments.extend(["-map", video_map])
+    if video_tail_extension and fill:
+        pass
+    elif video_tail_extension:
+        arguments.extend(["-map", facts["audio_map"]])
+    else:
+        arguments.extend(["-map", video_map, "-map", facts["audio_map"]])
+        if fill:
+            arguments.extend(["-af", AUDIO_GAP_FILTER])
     arguments.extend([
-        "-map", facts["audio_map"],
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
         "-threads", "2", "-c:a", "aac", "-ac", "1", "-ar", "16000", "-sn", "-dn", str(output),
     ])
@@ -820,7 +1081,7 @@ def identity_with_hold(identity, hold):
     return extended
 
 
-def clip_window(run, entry, source, window, probe, sha, save, read, source_facts, video_tail_policy=None):
+def clip_window(run, entry, source, window, probe, sha, save, read, source_facts, video_tail_policy=None, audio_gap_policy=None):
     checked_window(window)
     facts = check_source_probe(probe, source["audioStreamIndex"])
     start, end = int(entry["start_ticks"]), int(entry["end_ticks"])
@@ -847,9 +1108,22 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
         extended = identity_with_hold(identity, decide_video_tail_hold(source, probe, end, video_tail_policy))
         if stored == extended and digest_ok:
             return path, state
+        if audio_gap_policy not in (None, ""):
+            if audio_gap_policy != AUDIO_GAP_POLICY:
+                raise ContractError("unknown audio gap policy")
+            decision = measure_audio_gaps(source["sourcePath"], source["audioStreamIndex"], start)
+            filled = identity_with_audio_gap(extended, decision)
+            if stored == filled and digest_ok:
+                return path, state
         raise ContractError("Cached clip changed")
+    if audio_gap_policy not in (None, "", AUDIO_GAP_POLICY):
+        raise ContractError("unknown audio gap policy")
     hold = decide_video_tail_hold(source, probe, end, video_tail_policy)
     identity = identity_with_hold(identity, hold)
+    decision = None
+    if audio_gap_policy == AUDIO_GAP_POLICY:
+        decision = measure_audio_gaps(source["sourcePath"], source["audioStreamIndex"], start)
+        identity = identity_with_audio_gap(identity, decision)
     if path.exists():
         raise ContractError("Unverified clip already exists")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -857,8 +1131,10 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
     if temporary.exists():
         raise ContractError("Interrupted clip needs inspection")
     extension = None if not hold else hold["extensionSeconds"]
+    fill = bool(decision and decision.get("status") == "gaps")
     arguments, _ = clip_ffmpeg_arguments(
-        source["sourcePath"], start, source["audioStreamIndex"], temporary, probe, extension)
+        source["sourcePath"], start, source["audioStreamIndex"], temporary, probe, extension,
+        fill_audio_gap=fill)
     arguments[0] = "/usr/local/bin/ffmpeg"
     started = time.monotonic()
     subprocess.run(arguments, check=True, timeout=180)
@@ -868,10 +1144,17 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
     kinds = {stream["codec_type"] for stream in probe_out["streams"]}
     if not {"video", "audio"} <= kinds or len([stream for stream in probe_out["streams"] if stream["codec_type"] == "video"]) != 1:
         raise ContractError("clip does not contain exactly one video stream and one audio stream")
+    video_seconds = None
     for stream in probe_out["streams"]:
         if stream["codec_type"] in {"video", "audio"}:
             if abs(float(stream.get("start_time", "0"))) > 0.15 or not clip_duration_accepted(float(stream["duration"])):
                 raise ContractError("clipped container is outside 12 seconds plus or minus 0.15")
+        if stream["codec_type"] == "video" and video_seconds is None:
+            video_seconds = float(stream["duration"])
+    pcm = read_decoded_pcm(temporary)
+    require_decoded_coverage(pcm, video_seconds)
+    if fill:
+        require_gap_silence(pcm, decision["gaps"])
     source_facts(source)
     temporary.rename(path)
     state = {"identity": identity, "sha256": sha(path), "probe": probe_out,
@@ -886,6 +1169,8 @@ def clip_window(run, entry, source, window, probe, sha, save, read, source_facts
             "videoEndSeconds": hold["videoEndSeconds"],
             "audioEndSeconds": hold["audioEndSeconds"],
         }
+    if fill:
+        state["audioGap"] = audio_gap_record(identity)
     save(state_path, state)
     return path, state
 
@@ -931,7 +1216,7 @@ def run_embedding(embed, args, run, protocol):
     try:
         with embed.closing(embed.prepared_entries(
                 run, entries, source, args.prefetch_clips, window, protocol.get("probe_facts"),
-                protocol.get("video_tail_policy"))) as jobs:
+                protocol.get("video_tail_policy"), protocol.get("audio_gap_policy"))) as jobs:
             while args.max_new_jobs is None or new_jobs < args.max_new_jobs:
                 entry = next(jobs, None)
                 if entry is None:

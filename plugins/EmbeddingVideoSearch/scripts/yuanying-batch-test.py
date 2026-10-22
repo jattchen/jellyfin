@@ -491,7 +491,7 @@ class TranscriptionBoundaries(unittest.TestCase):
 
     def test_unknown_checkpoint_is_not_sent_again(self):
         entry = {"candidate_id": "joint-1", "start_ticks": 0, "end_ticks": contract.LENGTH_TICKS}
-        for status in ("completion-unknown", "inflight", "started"):
+        for status in ("completion-unknown", "inflight", "started", "terminal-invalid"):
             sent = []
             with self.assertRaises(batch.BatchBlocked) as caught:
                 batch.dispatch_entries(
@@ -1393,6 +1393,109 @@ class VideoTailBatch(unittest.TestCase):
             self.assertEqual(code, 3)
             self.assertEqual(summary["stopped"], "F001")
             self.assertEqual(summary["films"][0]["status"], "inflight")
+
+
+class AudioGapBatch(unittest.TestCase):
+    def test_unknown_policy_refuses_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            config = config_for(root, [row], output)
+            config["audioGapPolicy"] = "fill-everything"
+            with self.assertRaises(batch.BatchBlocked) as caught:
+                batch.preflight(config)
+            self.assertEqual(caught.exception.reason, "config")
+            self.assertFalse(output.exists())
+
+    def test_policy_is_stamped_without_scanning_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["probe"] = duration_probe("12.000000", "12.000000")
+            config = config_for(root, [row], output)
+            config["audioGapPolicy"] = contract.AUDIO_GAP_POLICY
+            config["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+            summary = batch.preflight(config)
+            self.assertEqual(summary["audioGapPolicy"], contract.AUDIO_GAP_POLICY)
+            protocol = batch.read_json(output / "films" / "F001" / "embed" / "protocol.json")
+            self.assertEqual(protocol["audio_gap_policy"], contract.AUDIO_GAP_POLICY)
+            self.assertEqual(protocol["video_tail_policy"], contract.VIDEO_TAIL_POLICY)
+            asr = batch.read_json(output / "films" / "F001" / "asr" / "protocol.json")
+            self.assertNotIn("audio_gap_policy", asr)
+
+    def test_whitelist_does_not_resend_a_terminal_invalid_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            row = source_file(root / "media", "film-F001.mp4", str(uuid.uuid4()), contract.LENGTH_TICKS, label="F001")
+            row["probe"] = duration_probe("12.000000", "12.000000")
+            config = config_for(root, [row], output)
+            config["audioGapPolicy"] = contract.AUDIO_GAP_POLICY
+            config["audioGapRecovery"] = {
+                "version": "audio-gap-recovery-v1",
+                "film": "F041",
+                "candidate": "joint-named-once",
+                "inputHash": "ab" * 32,
+                "stateSha256": "cd" * 32,
+                "responseSha256": "ef" * 32,
+                "clipSha256": "12" * 32,
+                "clipMetaSha256": "34" * 32,
+                "snapshotSha256": "56" * 32,
+                "errorCode": "invalid_media",
+            }
+            batch.preflight(config)
+            film = output / "films" / "F001"
+            succeed_transcription(film, [])
+            batch.publish_transcription(film / "asr", film / "embed")
+            protocol = batch.read_json(film / "embed" / "protocol.json")
+            entry = protocol["joint_windows"][0]
+            batch.write_json(film / "embed" / "joint" / (entry["candidate_id"] + ".state.json"), {
+                "candidate_id": entry["candidate_id"], "status": "terminal-invalid",
+                "http_status": 422, "input_hash": "ab" * 32,
+            })
+            sent = []
+            code, summary = batch.run_batch(
+                config,
+                execute=lambda label, stage: sent.append((label, stage)) or 0,
+                send=lambda label, stage, item: sent.append(("send", label, item["candidate_id"])),
+            )
+            self.assertEqual(sent, [])
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["reason"], "not-succeeded")
+            self.assertEqual(summary["films"][0]["status"], "terminal-invalid")
+
+    def test_gap_record_changes_the_candidate_hash(self):
+        protocol = {"signature": {"id": "model"}, "window": contract.window_template()}
+        entry = {"candidate_id": "joint-1", "start_ticks": 0, "end_ticks": contract.LENGTH_TICKS}
+        gap = {
+            "audio_gap_policy": contract.AUDIO_GAP_POLICY,
+            "audio_gap_total_seconds": "0.080000",
+            "audio_gap_count": 1,
+            "audio_gaps": [{"start_seconds": "0.256000", "end_seconds": "0.336000", "seconds": "0.080000"}],
+        }
+        old = batch.candidate_hash(protocol, "joint", entry, "abc")
+        filled = batch.candidate_hash(protocol, "joint", entry, "abc", gap)
+        self.assertNotEqual(old, filled)
+        reused = batch.dispatch_entries(
+            [entry], lambda _entry: {"status": "succeeded", "input_hash": old}, [],
+            protocol, "joint", lambda _entry: "abc", lambda _entry: None,
+        )
+        self.assertEqual(reused["reused"], ["joint-1"])
+        self.assertEqual(reused["sent"], [])
+        with self.assertRaises(batch.BatchBlocked) as caught:
+            batch.dispatch_entries(
+                [entry], lambda _entry: {"status": "succeeded", "input_hash": old}, [],
+                protocol, "joint", lambda _entry: "abc", lambda _entry: gap,
+            )
+        self.assertEqual(caught.exception.reason, "cache-hash-mismatch")
+        matched = batch.dispatch_entries(
+            [entry], lambda _entry: {"status": "succeeded", "input_hash": filled}, [],
+            protocol, "joint", lambda _entry: "abc", lambda _entry: gap,
+        )
+        self.assertEqual(matched["sent"], [])
+        self.assertEqual(matched["reused"], ["joint-1"])
 
 
 if __name__ == "__main__":

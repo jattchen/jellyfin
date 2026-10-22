@@ -173,6 +173,24 @@ $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$REC
 $PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
 ```
 
+音轨内部的时间戳空档是另一条显式规则，不能靠把静音接到结尾、拉长或压短后面的声音来过。配置里的 `audioGapPolicy` 必须正好是 `audio-gap-silence-at-source-pts-200ms-v1`。没写，或写成空字符串，切片方式和以前一样。写成别的值，准备阶段就拒绝。
+
+这条规则只在新切一扇窗口、并且测到至少一处大于 1 毫秒的正向内部空档时启用。空档要落在窗口里面，按切片时间轴的原位置补静音。音轨包上的时间会先减去这条音轨自己的起点，才是和画面同一次寻址后的位置。开头或结尾本来就短一截，仍走原来的时长检查，不算内部空档。一扇 12 秒窗口里，这些内部空档加起来不得超过 200 毫秒；超过就停下，不写出切片，也不用补静音掩盖任意丢失。时间戳逆行、重叠、缺失、不是有限数，或者空档位置对不上，都停下。小于等于 1 毫秒的抖动当成连续音轨，命令和身份都保持原样。
+
+补过的切片把策略、空档条数、总长和每一处相对窗口起点的起止写进身份。输入哈希也带上这些字段。没有空档的切片不写这些字段，已经成功的缓存哈希保持不变，也不重切。上传前先把音轨解码成采样来数，容器时长单独显示 12 秒也不够。解码结果仍要落在 12 秒正负 150 毫秒里，画面取样仍是第 0、3、6、9 秒。
+
+新目录要另写 `audioGapRecovery`。它不能和存储中断或片尾恢复同时写。对象里要有模式版本 `audio-gap-recovery-v1`、片号、候选、输入哈希、状态哈希、响应哈希、切片哈希、切片记录哈希、快照哈希，以及错误码 `invalid_media`。`audioGapPolicy` 也必须是上面那条补静音策略。画面是否需要定格，不由这条恢复来判断；协议里已经有的定格策略会保留。
+
+准备阶段先核对快照。已经成功的音画、文字和共享文档仍逐条核对。只省略白名单上那一条失败窗口的四份文件：响应、状态、切片和切片记录。它必须是唯一的未成功音画，状态是 `terminal-invalid`，HTTP 是 422，响应错误码是 `invalid_media`，而且每一份哈希都对得上。第二条失败、未知状态、哈希不符或错误码不对，都整批拒绝，这时还没有新目录。还没开始的窗口没有状态文件，不算失败。
+
+新目录里的嵌入协议带上这条空档策略。之后的普通运行会把这扇缺了的窗口切一次。白名单本身不会让一次普通运行重发旧目录里仍在的失败。回执写明模式、白名单、省略的四份文件、复用了多少条成功音画，以及模型请求数是 0、要重切的窗口数是 1。它不是整批成功，也不是转写准确性验收。
+
+```bash
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-recovery.py prepare --config "$RECOVERY_CONFIG"
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG" --film FILM
+$PY -B plugins/EmbeddingVideoSearch/scripts/yuanying-batch.py run --config "$RECOVERY_CONFIG"
+```
+
 再跑一次 `prepare` 时，新目录的字节如果和回执一致，就不再重写，也不再复核。`--film` 只进入点名的那一部。它可以重复。写了不存在的编号会拒绝。它不放宽失败即停。
 
 屏幕上的进度只显示 `F001` 这类编号、覆盖状态和数量，不显示路径、原文、向量或令牌。带路径的清单留在输出目录的私有文件里。

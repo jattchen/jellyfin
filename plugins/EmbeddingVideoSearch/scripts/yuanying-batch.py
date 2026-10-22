@@ -233,6 +233,9 @@ def require_config(config):
     video_tail = config.get("videoTailPolicy", None)
     if video_tail not in (None, "", contract.VIDEO_TAIL_POLICY):
         raise BatchBlocked("unknown video tail policy", reason="config")
+    audio_gap = config.get("audioGapPolicy", None)
+    if audio_gap not in (None, "", contract.AUDIO_GAP_POLICY):
+        raise BatchBlocked("unknown audio gap policy", reason="config")
     for key in ("sourceDirectory", "sourceFacts", "outputRoot", "workerPython", "asrModel", "alignerModel"):
         if not config.get(key):
             raise BatchBlocked("config missing " + key, reason="config")
@@ -365,6 +368,8 @@ def root_protocol(config, films):
         protocol["alignmentTimePolicy"] = ALIGNMENT_TIME_POLICY
     if config.get("videoTailPolicy") == contract.VIDEO_TAIL_POLICY:
         protocol["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
+    if config.get("audioGapPolicy") == contract.AUDIO_GAP_POLICY:
+        protocol["audioGapPolicy"] = contract.AUDIO_GAP_POLICY
     return protocol
 
 
@@ -410,6 +415,8 @@ def embed_protocol(record, config, output_root):
     }
     if config.get("videoTailPolicy") == contract.VIDEO_TAIL_POLICY:
         protocol["video_tail_policy"] = contract.VIDEO_TAIL_POLICY
+    if config.get("audioGapPolicy") == contract.AUDIO_GAP_POLICY:
+        protocol["audio_gap_policy"] = contract.AUDIO_GAP_POLICY
     return protocol
 
 
@@ -786,9 +793,16 @@ def load_checkpoints(asr_run):
     return checkpoints
 
 
-def candidate_hash(protocol, kind, entry, clip_sha=None):
-    digest, _window = embed.embedding_input(protocol, kind, entry, clip_sha)
+def candidate_hash(protocol, kind, entry, clip_sha=None, audio_gap=None):
+    digest, _window = embed.embedding_input(protocol, kind, entry, clip_sha, audio_gap)
     return digest
+
+
+def joint_audio_gap(embed_run, entry):
+    path = Path(embed_run) / "clips" / (entry["candidate_id"] + ".clip.json")
+    if not path.is_file():
+        return None
+    return contract.audio_gap_record(read_json(path).get("identity"))
 
 
 def joint_clip_sha(embed_run, entry):
@@ -805,7 +819,7 @@ def state_for(embed_run, kind, entry):
     return read_json(path)
 
 
-def dispatch_entries(entries, lookup_state, send, protocol, kind, clip_sha_for):
+def dispatch_entries(entries, lookup_state, send, protocol, kind, clip_sha_for, audio_gap_for=None):
     sent, reused = [], []
     for entry in entries:
         state = lookup_state(entry)
@@ -819,7 +833,10 @@ def dispatch_entries(entries, lookup_state, send, protocol, kind, clip_sha_for):
                 "unresolved checkpoint; not sending again",
                 reason="not-succeeded", status=status, stage=kind,
             )
-        expected = candidate_hash(protocol, kind, entry, None if kind != "joint" else clip_sha_for(entry))
+        gap = None
+        if kind == "joint" and audio_gap_for is not None:
+            gap = audio_gap_for(entry)
+        expected = candidate_hash(protocol, kind, entry, None if kind != "joint" else clip_sha_for(entry), gap)
         if state.get("input_hash") != expected:
             raise BatchBlocked("cached input hash does not match this candidate", reason="cache-hash-mismatch", stage=kind)
         reused.append(entry["candidate_id"])
@@ -967,7 +984,13 @@ def assess_film(film_dir):
                           stage="joint", nextAction={"action": "blocked", "stage": "joint"}, successfulEmpty=False)
             return result
         clip_sha = joint_clip_sha(embed_run, entry)
-        if clip_sha is None or state.get("input_hash") != candidate_hash(protocol, "joint", entry, clip_sha):
+        try:
+            gap = joint_audio_gap(embed_run, entry)
+        except contract.ContractError:
+            result.update(coverage="blocked", blocked=True, reason="cache-hash-mismatch", stage="joint",
+                          nextAction={"action": "blocked", "stage": "joint"}, successfulEmpty=False)
+            return result
+        if clip_sha is None or state.get("input_hash") != candidate_hash(protocol, "joint", entry, clip_sha, gap):
             result.update(coverage="blocked", blocked=True, reason="cache-hash-mismatch", stage="joint",
                           nextAction={"action": "blocked", "stage": "joint"}, successfulEmpty=False)
             return result
@@ -1015,13 +1038,15 @@ def step_film(film_dir, *, execute, send):
             entries = protocol["joint_windows"]
         else:
             entries = read_json(Path(film_dir) / "embed" / "candidates.json")
+        embed_run = Path(film_dir) / "embed"
         dispatch_entries(
             entries,
-            lambda entry, kind=stage: state_for(Path(film_dir) / "embed", kind, entry),
+            lambda entry, kind=stage: state_for(embed_run, kind, entry),
             send,
             protocol,
             stage,
-            lambda entry: joint_clip_sha(Path(film_dir) / "embed", entry),
+            lambda entry: joint_clip_sha(embed_run, entry),
+            lambda entry: joint_audio_gap(embed_run, entry),
         )
         return assess_film(film_dir)
     raise BatchBlocked("unknown stage", reason="config", stage=stage)
@@ -1301,6 +1326,8 @@ def preflight(config, *, check_model=False):
         summary["videoTailPolicy"] = contract.VIDEO_TAIL_POLICY
         summary["videoTailRisk"] = video_tails
         summary["pictureMap"] = picture_map
+    if config.get("audioGapPolicy") == contract.AUDIO_GAP_POLICY:
+        summary["audioGapPolicy"] = contract.AUDIO_GAP_POLICY
     if ready:
         write_json(Path(config["outputRoot"]) / "preflight.json", summary)
     return summary
@@ -1419,6 +1446,7 @@ def run_batch(config, *, execute=None, send=None, only_labels=None):
                         lambda entry, kind=stage: state_for(film_dir / "embed", kind, entry),
                         lambda entry, label=record["label"], kind=stage: send(label, kind, entry),
                         protocol, stage, lambda entry: joint_clip_sha(film_dir / "embed", entry),
+                        lambda entry: joint_audio_gap(film_dir / "embed", entry),
                     )
             except contract.ContractError as exc:
                 stopped = record["label"]

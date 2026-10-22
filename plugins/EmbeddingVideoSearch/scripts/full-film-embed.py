@@ -114,10 +114,12 @@ def validate_signature(response, signature, metadata=False):
         assert response.get(key) == value, 'Model signature mismatch: ' + key
 
 
-def embedding_input(protocol, kind, entry, clip_sha=None):
+def embedding_input(protocol, kind, entry, clip_sha=None, audio_gap=None):
     signature = protocol['signature']
     if kind == 'joint':
         payload = {'clip_sha256': clip_sha, 'signature': signature, 'kind': 'joint', 'candidate': entry}
+        if audio_gap:
+            payload['audio_gap'] = audio_gap
     else:
         payload = {'text': entry['text'], 'signature': signature, 'kind': 'document'}
     window = active_ten_second(protocol)
@@ -248,13 +250,13 @@ def _publish_shared_document(directory, input_hash, response_path, signature, wi
         save(shared_state, state)
 
 
-def clip(run, entry, source, window=None, probe=None, video_tail_policy=None):
+def clip(run, entry, source, window=None, probe=None, video_tail_policy=None, audio_gap_policy=None):
     if window is not None:
         module = profile_module(window.get("version"))
-        if video_tail_policy and window.get("version") == TWELVE_SECOND_VERSION:
+        if window.get("version") == TWELVE_SECOND_VERSION and (video_tail_policy or audio_gap_policy):
             return module.clip_window(
                 run, entry, source, window, probe, sha, save, read, source_facts,
-                video_tail_policy=video_tail_policy)
+                video_tail_policy=video_tail_policy, audio_gap_policy=audio_gap_policy)
         return module.clip_window(run, entry, source, window, probe, sha, save, read, source_facts)
     path = run / 'clips' / (entry['candidate_id'] + '.mp4')
     state_path = path.with_suffix('.clip.json')
@@ -303,7 +305,7 @@ def multipart(signature, path):
     return body, 'multipart/form-data; boundary=' + boundary
 
 
-def prepared_entries(run, entries, source, prefetch, window=None, probe=None, video_tail_policy=None):
+def prepared_entries(run, entries, source, prefetch, window=None, probe=None, video_tail_policy=None, audio_gap_policy=None):
     """Prepare at most the next CPU clip while the caller handles the current input."""
     if not prefetch or not entries:
         yield from entries
@@ -312,8 +314,9 @@ def prepared_entries(run, entries, source, prefetch, window=None, probe=None, vi
     def submit(pool, entry):
         if window is None:
             return pool.submit(clip, run, entry, source)
-        if video_tail_policy:
-            return pool.submit(clip, run, entry, source, window, probe, video_tail_policy)
+        if video_tail_policy or audio_gap_policy:
+            return pool.submit(
+                clip, run, entry, source, window, probe, video_tail_policy, audio_gap_policy)
         return pool.submit(clip, run, entry, source, window, probe)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -346,8 +349,9 @@ def dispatch(run, entry, protocol, kind):
         window = active_ten_second(protocol)
         path, clip_state = clip(
             run, entry, protocol['source'], window, protocol.get('probe_facts'),
-            protocol.get('video_tail_policy'))
-        input_hash, window = embedding_input(protocol, kind, entry, clip_state['sha256'])
+            protocol.get('video_tail_policy'), protocol.get('audio_gap_policy'))
+        audio_gap = sample_module().audio_gap_record((clip_state.get('identity') or {}))
+        input_hash, window = embedding_input(protocol, kind, entry, clip_state['sha256'], audio_gap)
     else:
         assert entry['text'].strip()
         input_hash, window = embedding_input(protocol, kind, entry)
